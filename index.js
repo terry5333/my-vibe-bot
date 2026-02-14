@@ -1,93 +1,151 @@
 const { Client, GatewayIntentBits, ActivityType, REST, Routes } = require('discord.js');
 const express = require('express');
 
-// --- 網頁伺服器保持在線 ---
+// --- 1. 建立 Web Server 保持在線 ---
 const app = express();
-app.get('/', (req, res) => res.send('Counting Bot is Online! 🎮'));
-app.listen(process.env.PORT || 3000);
+app.get('/', (req, res) => res.send('Vibe Bot is Online! 🚀'));
+app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server is running.'));
 
+// --- 2. 初始化 Discord Client ---
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-// --- 遊戲狀態 ---
-let isGameActive = false;
+// --- 3. 遊戲狀態變數 ---
+// Counting 遊戲
+let isCountingActive = false;
 let currentCount = 0;
-let lastUserId = null;
+let lastCountUserId = null;
 
-// --- 定義斜線指令 ---
+// 終極密碼遊戲
+let isGuessActive = false;
+let secretAnswer = 0;
+let minRange = 1;
+let maxRange = 100;
+
+// --- 4. 定義斜線指令 ---
 const commands = [
   {
     name: 'counting',
-    description: '開始一場 Counting 遊戲！',
+    description: '開始一場 Counting 遊戲'
+  },
+  {
+    name: 'guess',
+    description: '開始一場終極密碼遊戲 (1-100)'
   },
   {
     name: 'stop',
-    description: '停止當前的遊戲',
+    description: '停止所有正在進行的遊戲'
+  },
+  {
+    name: 'vibe',
+    description: '檢查機器人的 Vibe 狀態'
   }
 ];
 
-// --- 註冊斜線指令的函式 ---
+// --- 5. 註冊斜線指令 ---
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
-    console.log('正在註冊斜線指令...');
+    console.log('正在刷新應用程式斜線指令...');
     await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID), // 需要新增 CLIENT_ID 環境變數
+      Routes.applicationCommands(process.env.CLIENT_ID),
       { body: commands }
     );
-    console.log('斜線指令註冊成功！');
+    console.log('成功註冊斜線指令！');
   } catch (error) {
-    console.error(error);
+    console.error('註冊指令時出錯:', error);
   }
 }
 
 client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  registerCommands(); // 啟動時自動註冊
+  console.log(`已成功登入為 ${client.user.tag}!`);
+  client.user.setActivity('大家玩遊戲', { type: ActivityType.Watching });
+  registerCommands();
 });
 
-// --- 處理斜線指令回覆 ---
+// --- 6. 處理斜線指令 (Interactions) ---
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'counting') {
-    if (isGameActive) {
-      return interaction.reply(`遊戲已經在進行中囉！目前的數字是：${currentCount}`);
-    }
-    isGameActive = true;
-    currentCount = 0;
-    lastUserId = null;
-    await interaction.reply('🎮 **Counting 遊戲開始！** 請直接輸入 **1** 開始接力。');
+  const { commandName } = interaction;
+
+  if (commandName === 'vibe') {
+    await interaction.reply('✨ Vibe 狀態：極佳！目前的遊戲伺服器運行正常。');
   }
 
-  if (interaction.commandName === 'stop') {
-    isGameActive = false;
-    await interaction.reply(`🛑 遊戲已手動停止。最後紀錄為：${currentCount}`);
+  if (commandName === 'counting') {
+    if (isCountingActive) return interaction.reply(`Counting 遊戲已在進行中，目前數字：${currentCount}`);
+    isCountingActive = true;
+    isGuessActive = false; // 避免遊戲衝突
+    currentCount = 0;
+    lastCountUserId = null;
+    await interaction.reply('🎮 **Counting 遊戲開始！** 請從 **1** 開始數數...');
+  }
+
+  if (commandName === 'guess') {
+    if (isGuessActive) return interaction.reply(`終極密碼已在進行中，目前範圍：${minRange} ~ ${maxRange}`);
+    isGuessActive = true;
+    isCountingActive = false; // 避免遊戲衝突
+    secretAnswer = Math.floor(Math.random() * 100) + 1;
+    minRange = 1;
+    maxRange = 100;
+    await interaction.reply(`🎲 **終極密碼開始！** 數字範圍：**1 ~ 100**。請直接輸入數字！`);
+  }
+
+  if (commandName === 'stop') {
+    isCountingActive = false;
+    isGuessActive = false;
+    await interaction.reply('🛑 所有遊戲已停止。');
   }
 });
 
-// --- 處理數字監聽 (這部分維持不變) ---
+// --- 7. 處理文字訊息監聽 (Game Logic) ---
 client.on('messageCreate', msg => {
-  if (msg.author.bot || !isGameActive) return;
+  if (msg.author.bot) return;
 
-  const number = parseInt(msg.content);
-  if (!isNaN(number) && /^\d+$/.test(msg.content)) {
-    const nextCount = currentCount + 1;
-    if (number === nextCount) {
-      if (msg.author.id === lastUserId) {
-        msg.react('❌');
-        msg.reply(`❌ **失敗！** 不能連續數兩次。遊戲結束！`);
-        isGameActive = false;
+  // --- Counting 邏輯 ---
+  if (isCountingActive) {
+    const num = parseInt(msg.content);
+    if (!isNaN(num) && /^\d+$/.test(msg.content)) {
+      const nextCount = currentCount + 1;
+      if (num === nextCount) {
+        if (msg.author.id === lastCountUserId) {
+          msg.react('❌');
+          msg.reply('❌ 不能連續數兩次！遊戲結束。');
+          isCountingActive = false;
+        } else {
+          currentCount = nextCount;
+          lastCountUserId = msg.author.id;
+          msg.react('✅');
+        }
       } else {
-        currentCount = nextCount;
-        lastUserId = msg.author.id;
-        msg.react('✅');
+        msg.react('❌');
+        msg.reply(`❌ 數錯了！應該是 ${nextCount}。遊戲重置。`);
+        isCountingActive = false;
       }
-    } else {
-      msg.react('❌');
-      msg.reply(`❌ **數錯了！** 應該是 ${nextCount}。遊戲結束！`);
-      isGameActive = false;
+    }
+  }
+
+  // --- 終極密碼邏輯 ---
+  if (isGuessActive) {
+    const guess = parseInt(msg.content);
+    if (!isNaN(guess) && /^\d+$/.test(msg.content)) {
+      if (guess === secretAnswer) {
+        msg.react('🎊');
+        msg.reply(`🎊 恭喜 ${msg.author} 猜中了！答案就是 **${secretAnswer}**。`);
+        isGuessActive = false;
+      } else if (guess > minRange && guess < secretAnswer) {
+        minRange = guess;
+        msg.reply(`📈 太小了！範圍變為：**${minRange} ~ ${maxRange}**`);
+      } else if (guess < maxRange && guess > secretAnswer) {
+        maxRange = guess;
+        msg.reply(`📉 太大了！範圍變為：**${minRange} ~ ${maxRange}**`);
+      }
     }
   }
 });
