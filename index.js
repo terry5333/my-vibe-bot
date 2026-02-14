@@ -2,126 +2,161 @@ const { Client, GatewayIntentBits, REST, Routes, ActionRowBuilder, ButtonBuilder
 const express = require('express');
 const admin = require('firebase-admin');
 
-// 1. Web Server
 const app = express();
-app.get('/', (req, res) => res.send('Bot is ready!'));
+app.get('/', (req, res) => res.send('Bot Alive'));
 app.listen(process.env.PORT || 10000);
 
-// 2. Firebase 初始化
+// --- Firebase 初始化 ---
 try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: "https://my-pos-4eeee-default-rtdb.firebaseio.com/"
-    });
-    console.log("🔥 Firebase 連線成功");
-} catch (e) { console.error("Firebase Error:", e.message); }
+    if (!admin.apps.length) {
+        admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_CONFIG)),
+            databaseURL: "https://my-pos-4eeee-default-rtdb.firebaseio.com/"
+        });
+    }
+} catch (e) { console.error("Firebase Init Error:", e); }
 
 const db = admin.database();
 const pointsRef = db.ref("userPoints");
 
-// 3. Discord Client
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers] });
-
-async function addPoints(userId, amount) {
-    try {
-        const userRef = pointsRef.child(userId);
-        const snapshot = await userRef.once("value");
-        const currentPoints = snapshot.val() || 0;
-        await userRef.set(currentPoints + amount);
-    } catch (e) { console.error("積分寫入失敗:", e.message); }
+// --- 工具函數：帶有逾時的讀取，防止機器人卡死 ---
+async function getDB(ref) {
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Firebase Timeout')), 5000));
+    const data = ref.once("value");
+    return Promise.race([data, timeout]);
 }
 
+const client = new Client({ 
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers] 
+});
+
+// --- 指令註冊 ---
 const commands = [
     { name: 'rank', description: '積分排行榜' },
-    { name: 'points', description: '個人積分' },
-    { name: 'setup-role', description: '身分組按鈕', options: [{ name: 'target-role', description: '身分組', type: ApplicationCommandOptionType.Role, required: true }], default_member_permissions: PermissionFlagsBits.Administrator.toString() },
-    { name: 'counting', description: '數數遊戲' },
-    { name: 'guess', description: '終極密碼' },
-    { name: 'hl', description: '高低牌' },
-    { name: 'stop', description: '停止遊戲' }
+    { name: 'points', description: '查詢個人積分' },
+    { name: 'setup-role', description: '設置身分組按鈕', options: [{ name: 'role', description: '選擇身分組', type: ApplicationCommandOptionType.Role, required: true }], default_member_permissions: PermissionFlagsBits.Administrator.toString() },
+    { name: 'counting', description: '開始數數遊戲' },
+    { name: 'guess', description: '開始終極密碼' },
+    { name: 'hl', description: '開始高低牌' }
 ];
 
 client.on('ready', async () => {
-    console.log(`🤖 已上線：${client.user.tag}`);
-    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    console.log(`✅ ${client.user.tag} 已登入`);
+    try {
+        const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    } catch (e) { console.error(e); }
 });
 
-let gameData = { counting: { active: false, current: 0, lastUser: null }, guess: { active: false, answer: 0, min: 1, max: 100 }, hl: { active: false, lastCard: 0 } };
+// 遊戲狀態
+let game = {
+    counting: { active: false, current: 0, lastUser: null },
+    guess: { active: false, answer: 0, min: 1, max: 100 },
+    hl: { active: false, lastCard: 0 }
+};
 
 client.on('interactionCreate', async interaction => {
-    if (interaction.isChatInputCommand()) {
-        const { commandName } = interaction;
+    try {
+        if (interaction.isChatInputCommand()) {
+            const { commandName } = interaction;
 
-        if (commandName === 'rank') {
-            await interaction.deferReply();
-            try {
-                const snapshot = await pointsRef.once("value");
+            if (commandName === 'rank') {
+                await interaction.deferReply();
+                const snapshot = await getDB(pointsRef).catch(() => null);
+                if (!snapshot) return interaction.editReply("❌ 資料庫連線逾時，請檢查 Firebase Rules。");
+                
                 const data = snapshot.val() || {};
-                const sorted = Object.entries(data).sort(([, a], [, b]) => b - a).slice(0, 10);
-                const desc = sorted.map(([id, pts], i) => `${i + 1}. <@${id}> - **${pts}** 分`).join('\n') || "尚無資料";
-                await interaction.editReply({ embeds: [new EmbedBuilder().setTitle('🏆 排行榜').setDescription(desc).setColor(0xFFD700)] });
-            } catch (e) { await interaction.editReply("❌ 讀取資料庫失敗。"); }
-        }
+                const sorted = Object.entries(data).sort(([,a], [,b]) => b - a).slice(0, 10);
+                const list = sorted.map(([id, p], i) => `${i+1}. <@${id}>: **${p}** 分`).join('\n') || "暫無資料";
+                await interaction.editReply({ embeds: [new EmbedBuilder().setTitle("🏆 積分排行榜").setDescription(list).setColor(0xFFAA00)] });
+            }
 
-        if (commandName === 'points') {
-            await interaction.deferReply({ ephemeral: true });
-            const snapshot = await pointsRef.child(interaction.user.id).once("value");
-            await interaction.editReply(`💰 你的積分：**${snapshot.val() || 0}**`);
-        }
+            if (commandName === 'setup-role') {
+                const role = interaction.options.getRole('role');
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`role_${role.id}`).setLabel(`領取/移除 ${role.name}`).setStyle(ButtonStyle.Primary)
+                );
+                await interaction.reply({ content: "點擊下方按鈕領取身分組：", components: [row] });
+            }
 
-        if (commandName === 'setup-role') {
-            const role = interaction.options.getRole('target-role');
-            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`tg_${role.id}`).setLabel(`領取 ${role.name}`).setStyle(ButtonStyle.Primary));
-            await interaction.reply({ content: `🎭 身分組按鈕`, components: [row] });
-        }
+            if (commandName === 'guess') {
+                game.guess = { active: true, answer: Math.floor(Math.random() * 100) + 1, min: 1, max: 100 };
+                await interaction.reply(`🎲 終極密碼開始！請輸入 **1 ~ 100** 之間的數字。`);
+            }
 
-        if (commandName === 'counting') { gameData.counting = { active: true, current: 0, lastUser: null }; await interaction.reply('🎮 數數開始！從 1 開始。'); }
-        if (commandName === 'guess') { gameData.guess = { active: true, answer: Math.floor(Math.random() * 100) + 1, min: 1, max: 100 }; await interaction.reply('🎲 終極密碼開始！'); }
-        if (commandName === 'hl') { 
-            gameData.hl.active = true; gameData.hl.lastCard = Math.floor(Math.random() * 13) + 1;
-            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('hl_h').setLabel('大').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId('hl_l').setLabel('小').setStyle(ButtonStyle.Danger));
-            await interaction.reply({ content: `🃏 當前：${gameData.hl.lastCard}`, components: [row] });
-        }
-    }
-
-    if (interaction.isButton()) {
-        if (interaction.customId.startsWith('tg_')) {
-            const roleId = interaction.customId.replace('tg_', '');
-            const role = interaction.guild.roles.cache.get(roleId);
-            if (interaction.member.roles.cache.has(role.id)) { await interaction.member.roles.remove(role); await interaction.reply({ content: '已移除', ephemeral: true }); }
-            else { await interaction.member.roles.add(role); await interaction.reply({ content: '已領取', ephemeral: true }); }
-        }
-
-        if (interaction.customId.startsWith('hl_')) {
-            if (!gameData.hl.active) return;
-            const next = Math.floor(Math.random() * 13) + 1;
-            const win = (interaction.customId === 'hl_h' && next >= gameData.hl.lastCard) || (interaction.customId === 'hl_l' && next <= gameData.hl.lastCard);
-            if (win) {
-                await addPoints(interaction.user.id, 5);
-                gameData.hl.lastCard = next;
-                await interaction.update({ content: `✅ 猜對！(+5分) 下一張：**${next}**` });
-            } else {
-                gameData.hl.active = false;
-                await interaction.update({ content: `💥 猜錯！是 **${next}**`, components: [] });
+            if (commandName === 'hl') {
+                game.hl.active = true;
+                game.hl.lastCard = Math.floor(Math.random() * 13) + 1;
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('hl_h').setLabel('更大').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId('hl_l').setLabel('更小').setStyle(ButtonStyle.Danger)
+                );
+                await interaction.reply({ content: `🃏 當前點數為：**${game.hl.lastCard}**，下一張會更...？`, components: [row] });
             }
         }
-    }
+
+        if (interaction.isButton()) {
+            // 處理身分組
+            if (interaction.customId.startsWith('role_')) {
+                const roleId = interaction.customId.split('_')[1];
+                const role = interaction.guild.roles.cache.get(roleId);
+                if (!role) return interaction.reply({ content: "找不到該身分組", ephemeral: true });
+
+                try {
+                    if (interaction.member.roles.cache.has(roleId)) {
+                        await interaction.member.roles.remove(role);
+                        await interaction.reply({ content: `✅ 已移除 ${role.name}`, ephemeral: true });
+                    } else {
+                        await interaction.member.roles.add(role);
+                        await interaction.reply({ content: `✅ 已領取 ${role.name}`, ephemeral: true });
+                    }
+                } catch (e) {
+                    await interaction.reply({ content: "❌ 權限不足！請確保機器人的身分組順序在該身分組之上。", ephemeral: true });
+                }
+            }
+
+            // 處理高低牌
+            if (interaction.customId.startsWith('hl_')) {
+                if (!game.hl.active) return interaction.reply({ content: "遊戲已結束", ephemeral: true });
+                const nextCard = Math.floor(Math.random() * 13) + 1;
+                const isHigher = nextCard >= game.hl.lastCard;
+                const userGuessHigher = interaction.customId === 'hl_h';
+
+                if (userGuessHigher === isHigher) {
+                    game.hl.lastCard = nextCard;
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId('hl_h').setLabel('更大').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId('hl_l').setLabel('更小').setStyle(ButtonStyle.Danger)
+                    );
+                    await interaction.update({ content: `✅ 猜對了！下一張是 **${nextCard}**。繼續猜？`, components: [row] });
+                } else {
+                    game.hl.active = false;
+                    await interaction.update({ content: `❌ 猜錯了！下一張是 **${nextCard}**。遊戲結束。`, components: [] });
+                }
+            }
+        }
+    } catch (err) { console.error("Interaction Error:", err); }
 });
 
 client.on('messageCreate', async msg => {
-    if (msg.author.bot) return;
-    if (gameData.counting.active) {
-        const num = parseInt(msg.content);
-        if (num === gameData.counting.current + 1 && msg.author.id !== gameData.counting.lastUser) {
-            gameData.counting.current++; gameData.counting.lastUser = msg.author.id;
-            await addPoints(msg.author.id, 1); await msg.react('✅');
+    if (msg.author.bot || !msg.guild) return;
+
+    // 終極密碼邏輯
+    if (game.guess.active) {
+        const guess = parseInt(msg.content);
+        if (isNaN(guess)) return;
+
+        if (guess === game.guess.answer) {
+            game.guess.active = false;
+            await msg.reply(`🎊 恭喜！答案就是 **${guess}**！`);
+            // 加分邏輯可在此添加
+        } else if (guess > game.guess.answer) {
+            game.guess.max = Math.min(game.guess.max, guess);
+            await msg.reply(`📉 更小一點！目前範圍：${game.guess.min} ~ ${game.guess.max}`);
+        } else {
+            game.guess.min = Math.max(game.guess.min, guess);
+            await msg.reply(`📈 更大一點！目前範圍：${game.guess.min} ~ ${game.guess.max}`);
         }
-    }
-    if (gameData.guess.active && parseInt(msg.content) === gameData.guess.answer) {
-        await addPoints(msg.author.id, 50); await msg.reply(`🎊 猜中了！獲得 50 積分。`);
-        gameData.guess.active = false;
     }
 });
 
