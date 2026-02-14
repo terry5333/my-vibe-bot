@@ -1,21 +1,17 @@
 /**
  * ✅ Discord Developer Portal Intents 設定（非常重要，否則文字遊戲會失效）
- * 1) 前往：https://discord.com/developers/applications → 選你的 Bot → "Bot" 分頁
- * 2) 在 "Privileged Gateway Intents" 開啟：
- *    - ✅ MESSAGE CONTENT INTENT   （必開：讓 messageCreate 讀到玩家輸入）
- *    - ✅ SERVER MEMBERS INTENT    （建議：身分組切換更穩）
+ * 1) https://discord.com/developers/applications → 選你的 Bot → Bot 分頁
+ * 2) Privileged Gateway Intents 開啟：
+ *    - ✅ MESSAGE CONTENT INTENT   （必開：messageCreate 要讀到玩家輸入）
+ *    - ✅ SERVER MEMBERS INTENT    （建議：身分組/管理功能更穩）
  * 3) 程式端也必須包含 GatewayIntentBits.MessageContent（本檔案已包含）
  *
- * ✅ Render 託管注意
- * - Render 需要 HTTP 服務維持運作 → 必須開 Express Server（本檔案已包含）
+ * ✅ Render 需要 Express Server 維持運作（本檔案已包含）
+ * ✅ Firebase 從 process.env.FIREBASE_CONFIG 讀取 service account JSON（本檔案已處理 \n）
  *
- * ✅ Firebase 認證注意
- * - 從 process.env.FIREBASE_CONFIG 讀取「服務帳戶 JSON」字串（Render 的 ENV）
- * - private_key 裡的 \n 會自動轉回真正換行（本檔案已處理）
- *
- * ✅ 絕不逾時的互動策略
- * - 所有會碰 DB 的 slash / button：一律 deferReply() 或 deferUpdate()
- * - DB 讀寫一律 async/await
+ * ✅ 絕不逾時策略（嚴格遵守）
+ * - 所有 DB 讀寫：async/await
+ * - 所有互動：deferReply / deferUpdate
  */
 
 "use strict";
@@ -33,16 +29,35 @@ const {
   ButtonStyle,
   PermissionsBitField,
 } = require("discord.js");
-
 const admin = require("firebase-admin");
 
 // =========================
-// Express Keep-Alive (Render)
+// Express Keep-Alive (Render) + Admin Page
 // =========================
 const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
+
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.listen(PORT, () => console.log(`[Express] Listening on :${PORT}`));
+
+// ===== Admin Page Auth =====
+function requireAdminToken(req) {
+  const token =
+    req.query.token ||
+    (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const expected = process.env.ADMIN_TOKEN || "";
+  return expected && token === expected;
+}
+
+function esc(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
 
 // =========================
 // Discord Client
@@ -52,7 +67,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // ✅ 必須：文字遊戲需要
-    GatewayIntentBits.GuildMembers,   // ✅ 建議：身分組切換更穩
+    GatewayIntentBits.GuildMembers, // ✅ 建議：身分組切換更穩
   ],
   partials: [Partials.Channel],
 });
@@ -71,7 +86,6 @@ function parseFirebaseConfig() {
   } catch {
     throw new Error("FIREBASE_CONFIG is not valid JSON");
   }
-  // private_key 常見會有 \n，需要轉回真正換行
   if (cfg.private_key && typeof cfg.private_key === "string") {
     cfg.private_key = cfg.private_key.replace(/\\n/g, "\n");
   }
@@ -106,19 +120,17 @@ function initFirebase() {
 initFirebase();
 
 // =========================
-// In-Memory Cache (Leaderboard)
+// In-Memory Cache (Leaderboard)  => /rank 秒回
 // =========================
 const leaderboardCache = {
   updatedAt: 0,
   top: [], // [{ userId, points }]
 };
-
 const userPointsCache = new Map(); // userId -> points
 
 async function refreshLeaderboardCache() {
   await dbReady;
   try {
-    // 取前 10 名：orderByValue + limitToLast
     const snap = await db.ref("points").orderByValue().limitToLast(10).get();
     const val = snap.val() || {};
     const arr = Object.entries(val)
@@ -132,17 +144,13 @@ async function refreshLeaderboardCache() {
   }
 }
 
-// 每 20 秒刷新一次，確保 /rank 秒回
+// 定期刷新
 setInterval(() => {
   refreshLeaderboardCache().catch(() => {});
 }, 20_000);
 
 // =========================
 // ✅ 核心積分系統（全域函數）
-// addPoints(userId, amount)
-// - 確保 DB 已連線
-// - 寫入成功後才回傳
-// - transaction 避免同時加分競態
 // =========================
 async function addPoints(userId, amount) {
   if (!userId) throw new Error("addPoints: missing userId");
@@ -159,13 +167,10 @@ async function addPoints(userId, amount) {
     return cur + delta;
   });
 
-  if (!result.committed) {
-    throw new Error("addPoints: transaction not committed");
-  }
+  if (!result.committed) throw new Error("addPoints: transaction not committed");
 
   const newPoints = Number(result.snapshot.val()) || 0;
   userPointsCache.set(userId, newPoints);
-
   bumpLeaderboardCache(userId, newPoints);
   return newPoints;
 }
@@ -193,6 +198,124 @@ async function getPoints(userId) {
 }
 
 // =========================
+// Admin Page (Express): 查看/加分/扣分
+// =========================
+app.get("/admin", async (req, res) => {
+  if (!requireAdminToken(req)) return res.status(401).send("Unauthorized");
+
+  await dbReady;
+
+  const qUserId = (req.query.userId || "").trim();
+  let userPoints = null;
+
+  if (qUserId) {
+    const snap = await db.ref(`points/${qUserId}`).get();
+    userPoints = Number(snap.val()) || 0;
+  }
+
+  const snap = await db.ref("points").orderByValue().limitToLast(50).get();
+  const val = snap.val() || {};
+  const top = Object.entries(val)
+    .map(([userId, points]) => ({ userId, points: Number(points) || 0 }))
+    .sort((a, b) => b.points - a.points);
+
+  const token = esc(req.query.token || "");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Admin - Points</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 16px; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { border: 1px solid #ddd; padding: 8px; }
+          th { background: #f5f5f5; text-align: left; }
+          .box { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+          input { padding: 6px; margin: 4px 0; width: 360px; max-width: 100%; }
+          button { padding: 8px 12px; }
+          code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+        </style>
+      </head>
+      <body>
+        <h2>Points Admin</h2>
+        <div class="box">
+          <div>開啟方式：<code>/admin?token=ADMIN_TOKEN</code></div>
+          <div>查詢玩家：<code>/admin?token=...&userId=...</code></div>
+        </div>
+
+        <div class="box">
+          <h3>查詢玩家</h3>
+          <form method="GET" action="/admin">
+            <input type="hidden" name="token" value="${token}" />
+            <input name="userId" placeholder="Discord User ID" value="${esc(qUserId)}" />
+            <button type="submit">查詢</button>
+          </form>
+          ${
+            qUserId
+              ? `<p>userId: <code>${esc(
+                  qUserId
+                )}</code> points: <b>${userPoints}</b></p>`
+              : `<p>輸入 userId 查詢單人分數</p>`
+          }
+        </div>
+
+        <div class="box">
+          <h3>加分 / 扣分（扣分用負數）</h3>
+          <form method="POST" action="/admin/adjust?token=${token}">
+            <div><input name="userId" placeholder="Discord User ID" required /></div>
+            <div><input name="amount" placeholder="Amount (e.g. 50 or -10)" required /></div>
+            <button type="submit">送出</button>
+          </form>
+        </div>
+
+        <div class="box">
+          <h3>Top 50</h3>
+          <table>
+            <tr><th>#</th><th>User ID</th><th>Points</th></tr>
+            ${top
+              .map(
+                (x, i) =>
+                  `<tr><td>${i + 1}</td><td><code>${esc(
+                    x.userId
+                  )}</code></td><td><b>${x.points}</b></td></tr>`
+              )
+              .join("")}
+          </table>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/admin/adjust", async (req, res) => {
+  if (!requireAdminToken(req)) return res.status(401).send("Unauthorized");
+
+  const userId = String(req.body.userId || "").trim();
+  const amount = Number(req.body.amount);
+
+  if (!userId) return res.status(400).send("Missing userId");
+  if (!Number.isFinite(amount) || amount === 0)
+    return res.status(400).send("Invalid amount");
+
+  try {
+    await addPoints(userId, amount);
+    return res.redirect(
+      `/admin?token=${encodeURIComponent(
+        req.query.token
+      )}&userId=${encodeURIComponent(userId)}`
+    );
+  } catch (err) {
+    console.error("[AdminAdjust] Error:", err);
+    return res.status(500).send("Adjust failed");
+  }
+});
+
+// ✅ 只 listen 一次（避免你之前版本重複 listen）
+app.listen(PORT, () => console.log(`[Express] Listening on :${PORT}`));
+
+// =========================
 // Game State
 // =========================
 
@@ -201,6 +324,12 @@ const gameData = new Map(); // channelId -> { active, answer, min, max, hostId }
 
 // 高低牌：一人一局
 const hlGames = new Map(); // userId -> { current, streak }
+
+// Counting：同頻道一場
+const countingData = new Map(); // channelId -> { active, next, start, lastUserId, reward }
+
+// Firebase paths
+const COUNTING_PATH = "counting"; // counting/{guildId}/{channelId} -> state
 
 // =========================
 // Slash Commands
@@ -240,12 +369,30 @@ const commands = [
         .setDescription("按鈕顯示文字（可選）")
         .setRequired(false)
     ),
+
+  // Counting
+  new SlashCommandBuilder()
+    .setName("counting")
+    .setDescription("Counting 遊戲控制")
+    .addSubcommand((s) =>
+      s
+        .setName("start")
+        .setDescription("在此頻道啟動 counting")
+        .addIntegerOption((o) =>
+          o.setName("start").setDescription("起始數字（預設 1）").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o.setName("reward").setDescription("每次正確加分（預設 1）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) => s.setName("stop").setDescription("停止此頻道 counting"))
+    .addSubcommand((s) => s.setName("status").setDescription("查看此頻道 counting 狀態")),
 ].map((c) => c.toJSON());
 
-// 避免每次啟動都註冊導致 rate limit：用 REGISTER_COMMANDS=true 才註冊
 async function registerCommandsOnce() {
   const token = process.env.DISCORD_TOKEN;
   const clientId = process.env.DISCORD_CLIENT_ID;
+
   if (!token || !clientId) {
     console.warn(
       "[Commands] Missing DISCORD_TOKEN or DISCORD_CLIENT_ID, skip registering."
@@ -277,26 +424,59 @@ function randInt(min, max) {
 }
 
 function makeHLButtons() {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("hl:higher")
-      .setLabel("Higher")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId("hl:lower")
-      .setLabel("Lower")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId("hl:stop")
-      .setLabel("Stop")
-      .setStyle(ButtonStyle.Secondary)
-  );
-  return [row];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("hl:higher")
+        .setLabel("Higher")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("hl:lower")
+        .setLabel("Lower")
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId("hl:stop")
+        .setLabel("Stop")
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
 }
 
-function safeUserTag(user) {
-  if (!user) return "Unknown";
-  return user.globalName ? `${user.globalName} (@${user.username})` : `@${user.username}`;
+// Counting persistence
+async function loadCountingState(guildId, channelId) {
+  await dbReady;
+  const snap = await db
+    .ref(`${COUNTING_PATH}/${guildId}/${channelId}`)
+    .get();
+  const v = snap.val();
+  if (!v || !v.active) return null;
+  return {
+    active: true,
+    start: Number(v.start) || 1,
+    next: Number(v.next) || Number(v.start) || 1,
+    lastUserId: v.lastUserId || null,
+    reward: Number(v.reward) || 1,
+  };
+}
+
+async function saveCountingState(guildId, channelId, state) {
+  await dbReady;
+  await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).set({
+    active: !!state.active,
+    start: state.start,
+    next: state.next,
+    lastUserId: state.lastUserId || null,
+    reward: state.reward,
+    updatedAt: Date.now(),
+  });
+}
+
+async function stopCountingState(guildId, channelId) {
+  await dbReady;
+  await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).set({
+    active: false,
+    updatedAt: Date.now(),
+  });
 }
 
 // =========================
@@ -315,7 +495,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
-      // /guess
+      // /guess (修正版：答案不會落在邊界)
       if (commandName === "guess") {
         const channelId = interaction.channelId;
 
@@ -331,13 +511,16 @@ client.on("interactionCreate", async (interaction) => {
         const min = interaction.options.getInteger("min") ?? 1;
         const max = interaction.options.getInteger("max") ?? 100;
 
-        if (!Number.isInteger(min) || !Number.isInteger(max) || min === max) {
-          return interaction.editReply("min/max 需要是不同的整數喔。");
-        }
-
         const realMin = Math.min(min, max);
         const realMax = Math.max(min, max);
-        const answer = randInt(realMin, realMax);
+
+        if (realMax - realMin < 2) {
+          return interaction.editReply(
+            "範圍太小了，至少要像 1~3 這樣，答案才可能落在中間。"
+          );
+        }
+
+        const answer = randInt(realMin + 1, realMax - 1);
 
         gameData.set(channelId, {
           active: true,
@@ -348,7 +531,8 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         return interaction.editReply(
-          `🎯 終極密碼開始！範圍：**${realMin} ~ ${realMax}**\n請直接在此頻道輸入整數進行猜測。猜中者 +50 分！`
+          `🎯 終極密碼開始！範圍：**${realMin} ~ ${realMax}**\n` +
+            `請直接在此頻道輸入整數進行猜測（不含邊界）。猜中者 +50 分！`
         );
       }
 
@@ -358,7 +542,6 @@ client.on("interactionCreate", async (interaction) => {
 
         const userId = interaction.user.id;
         const current = randInt(1, 13);
-
         hlGames.set(userId, { current, streak: 0 });
 
         return interaction.editReply({
@@ -368,21 +551,22 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // /rank（快取秒回）
+      // /rank
       if (commandName === "rank") {
         const top = leaderboardCache.top;
-        const ageSec = Math.floor((Date.now() - leaderboardCache.updatedAt) / 1000);
-
-        if (!top.length) {
+        const ageSec = Math.floor(
+          (Date.now() - leaderboardCache.updatedAt) / 1000
+        );
+        if (!top.length)
           return interaction.reply("排行榜目前還沒有資料～先玩遊戲拿分吧！");
-        }
 
         const lines = top.map(
           (x, i) => `**#${i + 1}** <@${x.userId}> — **${x.points}**`
         );
-
         return interaction.reply(
-          `🏆 排行榜（Top ${top.length}）\n${lines.join("\n")}\n\n_快取更新：${ageSec}s 前_`
+          `🏆 排行榜（Top ${top.length}）\n${lines.join(
+            "\n"
+          )}\n\n_快取更新：${ageSec}s 前_`
         );
       }
 
@@ -397,19 +581,23 @@ client.on("interactionCreate", async (interaction) => {
       if (commandName === "setup-role") {
         await interaction.deferReply({ ephemeral: true });
 
-        if (!interaction.inGuild()) {
+        if (!interaction.inGuild())
           return interaction.editReply("此指令只能在伺服器中使用。");
-        }
 
         const role = interaction.options.getRole("role");
         const label =
           interaction.options.getString("label") || `切換身分組：${role.name}`;
 
         const me = interaction.guild.members.me;
-        if (!me) return interaction.editReply("我讀不到自己的伺服器成員資訊，請稍後再試。");
+        if (!me)
+          return interaction.editReply(
+            "我讀不到自己的伺服器成員資訊，請稍後再試。"
+          );
 
         if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-          return interaction.editReply("我沒有 **Manage Roles** 權限，無法幫你切換身分組。");
+          return interaction.editReply(
+            "我沒有 **Manage Roles** 權限，無法幫你切換身分組。"
+          );
         }
 
         const row = new ActionRowBuilder().addComponents(
@@ -426,213 +614,77 @@ client.on("interactionCreate", async (interaction) => {
 
         return interaction.editReply("已在頻道送出身分組切換按鈕。");
       }
-    }
 
-    // ===== Button Interactions =====
-    if (interaction.isButton()) {
-      const id = interaction.customId;
-
-      // HL game buttons
-      if (id.startsWith("hl:")) {
-        const userId = interaction.user.id;
-        const state = hlGames.get(userId);
-
-        if (!state) {
+      // /counting
+      if (commandName === "counting") {
+        if (!interaction.inGuild()) {
           return interaction.reply({
-            content: "你目前沒有正在進行的高低牌遊戲，請用 /hl 開始。",
+            content: "此指令只能在伺服器中使用。",
             ephemeral: true,
           });
         }
 
-        const action = id.split(":")[1];
+        const sub = interaction.options.getSubcommand();
+        const channelId = interaction.channelId;
+        const guildId = interaction.guildId;
 
-        if (action === "stop") {
-          hlGames.delete(userId);
-          return interaction.update({
-            content: `🛑 高低牌已結束。\n你的最終連勝：**${state.streak}**\n（需要再玩用 /hl）`,
-            components: [],
-          });
-        }
-
-        const next = randInt(1, 13);
-        const guessHigher = action === "higher";
-        const isCorrect =
-          (guessHigher && next > state.current) ||
-          (!guessHigher && next < state.current);
-
-        if (isCorrect) {
-          state.streak += 1;
-          state.current = next;
-
-          // ✅ 先 deferUpdate 保證不逾時，再等 DB 加分完成後 editReply
-          await interaction.deferUpdate();
-          const newPts = await addPoints(userId, 5);
-
-          return interaction.editReply({
-            content:
-              `✅ 猜對！+5 分（你目前總分：**${newPts}**）\n` +
-              `目前牌面：**${state.current}**（1~13）\n` +
-              `連勝：**${state.streak}**\n下一張更高還是更低？`,
-            components: makeHLButtons(),
-          });
-        } else {
-          hlGames.delete(userId);
-          return interaction.update({
-            content:
-              `❌ 猜錯！\n上一張：**${state.current}** → 下一張：**${next}**\n` +
-              `你的連勝停在：**${state.streak}**\n（再玩一次用 /hl）`,
-            components: [],
-          });
-        }
-      }
-
-      // Role toggle button
-      if (id.startsWith("role:toggle:")) {
-        if (!interaction.inGuild()) {
-          return interaction.reply({ content: "此按鈕只能在伺服器中使用。", ephemeral: true });
-        }
-
-        const roleId = id.split(":")[2];
         await interaction.deferReply({ ephemeral: true });
 
-        const guild = interaction.guild;
-        const member = await guild.members.fetch(interaction.user.id).catch(() => null);
-        if (!member) return interaction.editReply("我讀不到你的成員資訊，請稍後再試。");
+        if (sub === "start") {
+          const start = interaction.options.getInteger("start") ?? 1;
+          const reward = interaction.options.getInteger("reward") ?? 1;
 
-        const role =
-          guild.roles.cache.get(roleId) ||
-          (await guild.roles.fetch(roleId).catch(() => null));
-        if (!role) return interaction.editReply("找不到這個身分組，可能已被刪除。");
+          if (!Number.isInteger(start))
+            return interaction.editReply("start 必須是整數。");
+          if (!Number.isInteger(reward) || reward <= 0)
+            return interaction.editReply("reward 必須是正整數。");
 
-        try {
-          const hasRole = member.roles.cache.has(role.id);
+          const state = {
+            active: true,
+            start,
+            next: start,
+            lastUserId: null,
+            reward,
+          };
 
-          const me = guild.members.me;
-          if (!me) return interaction.editReply("我讀不到自己的伺服器成員資訊，請稍後再試。");
+          countingData.set(channelId, state);
+          await saveCountingState(guildId, channelId, state);
 
-          if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-            return interaction.editReply("我沒有 **Manage Roles** 權限，無法切換身分組。");
-          }
+          await interaction.channel.send(
+            `🔢 Counting 已啟動！請從 **${start}** 開始依序輸入數字。\n` +
+              `規則：同一人不能連續兩次｜每次正確 +${reward} 分`
+          );
 
-          // ✅ 身分組順序檢查（避免 50013）
-          const myTop = me.roles.highest;
-          if (myTop.comparePositionTo(role) <= 0) {
-            return interaction.editReply(
-              `我無法管理 <@&${role.id}>，因為我的最高身分組（${myTop.name}）順序不夠高。\n` +
-                `請把我的身分組移到比目標身分組更高的位置。`
-            );
-          }
+          return interaction.editReply("已啟動此頻道 counting。");
+        }
 
-          if (hasRole) {
-            await member.roles.remove(role.id);
-            return interaction.editReply(`已移除身分組：<@&${role.id}>`);
-          } else {
-            await member.roles.add(role.id);
-            return interaction.editReply(`已加入身分組：<@&${role.id}>`);
-          }
-        } catch (err) {
-          const msg = String(err?.message || err);
-          const code = err?.code;
+        if (sub === "stop") {
+          countingData.delete(channelId);
+          await stopCountingState(guildId, channelId);
+          await interaction.channel.send("🛑 Counting 已停止。");
+          return interaction.editReply("已停止此頻道 counting。");
+        }
 
-          if (code === 50013 || /Missing Permissions/i.test(msg)) {
-            return interaction.editReply(
-              "我沒有足夠權限來變更你的身分組（可能是權限不足或身分組順序太低）。\n" +
-                "請確認：\n" +
-                "1) 我有 **Manage Roles** 權限\n" +
-                "2) 我的最高身分組在目標身分組之上"
-            );
-          }
+        if (sub === "status") {
+          const mem =
+            countingData.get(channelId) ||
+            (await loadCountingState(guildId, channelId));
+          if (!mem?.active)
+            return interaction.editReply("此頻道目前沒有啟用 counting。");
 
-          console.error("[RoleToggle] Error:", err);
-          return interaction.editReply("切換身分組時發生錯誤，請稍後再試。");
+          countingData.set(channelId, mem);
+
+          return interaction.editReply(
+            `Counting 狀態：✅ 啟用中\n` +
+              `下一個應該輸入：**${mem.next}**\n` +
+              `起始值：${mem.start}｜reward：+${mem.reward}｜上一位：${
+                mem.lastUserId ? `<@${mem.lastUserId}>` : "無"
+              }`
+          );
         }
       }
     }
-  } catch (err) {
-    console.error("[interactionCreate] Unhandled error:", err);
-    try {
-      if (interaction.isRepliable()) {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply("發生錯誤，請稍後再試。");
-        } else {
-          await interaction.reply({ content: "發生錯誤，請稍後再試。", ephemeral: true });
-        }
-      }
-    } catch {}
-  }
-});
 
-// ---------- Guess Game via messageCreate ----------
-client.on("messageCreate", async (message) => {
-  try {
-    if (!message.guild) return;
-    if (message.author.bot) return;
-
-    const channelId = message.channel.id;
-    const state = gameData.get(channelId);
-    if (!state?.active) return;
-
-    const content = message.content.trim();
-
-    // 只接受純整數
-    if (!/^-?\d+$/.test(content)) return;
-    const guess = Number(content);
-    if (!Number.isInteger(guess)) return;
-
-    // 範圍外提示（不縮範圍）
-    if (guess <= state.min || guess >= state.max) {
-      return message.reply(`請猜 **${state.min} ~ ${state.max}** 之間的整數（不含邊界）。`);
-    }
-
-    if (guess === state.answer) {
-      gameData.delete(channelId);
-
-      const newPts = await addPoints(message.author.id, 50);
-
-      return message.reply(
-        `🎉 **猜中啦！答案是 ${state.answer}**\n` +
-          `${safeUserTag(message.author)} 獲得 **+50 分**（目前總分：**${newPts}**）\n` +
-          `本頻道終極密碼已結束，可用 /guess 再開一場。`
-      );
-    }
-
-    // 猜錯縮範圍
-    if (guess < state.answer) {
-      state.min = guess;
-      return message.reply(`太小了！新的範圍：**${state.min} ~ ${state.max}**`);
-    } else {
-      state.max = guess;
-      return message.reply(`太大了！新的範圍：**${state.min} ~ ${state.max}**`);
-    }
-  } catch (err) {
-    console.error("[messageCreate] GuessGame error:", err);
-  }
-});
-
-// =========================
-// Login
-// =========================
-const token = process.env.DISCORD_TOKEN;
-if (!token) {
-  console.error("Missing process.env.DISCORD_TOKEN");
-  process.exit(1);
-}
-client.login(token);
-
-// =========================
-// Graceful shutdown
-// =========================
-process.on("SIGINT", async () => {
-  console.log("SIGINT received, shutting down...");
-  try {
-    await client.destroy();
-  } catch {}
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM received, shutting down...");
-  try {
-    await client.destroy();
-  } catch {}
-  process.exit(0);
-});
+    // ===== Button Interactions =====
+    if (interaction.isButton()) {
+                             
