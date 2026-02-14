@@ -4,11 +4,11 @@ const {
 } = require('discord.js');
 const express = require('express');
 
-// --- 1. Web Server (Koyeb 健康檢查) ---
+// --- 1. Web Server (Koyeb 健康檢查與保持在線) ---
 const app = express();
 const port = process.env.PORT || 8080; 
 app.get('/', (req, res) => res.send('Vibe Bot is blazing fast on Koyeb! 🚀'));
-app.listen(port, () => console.log(`伺服器正監聽端口：${port}`));
+app.listen(port, () => console.log(`伺服器正在監聽端口：${port}`));
 
 // --- 2. 初始化 Client ---
 const client = new Client({
@@ -16,7 +16,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers // 必須開啟此 Intent 才能操作身份組
+        GatewayIntentBits.GuildMembers 
     ]
 });
 
@@ -31,49 +31,50 @@ let gameData = {
 const commands = [
     { name: 'counting', description: '開始 Counting 接力遊戲' },
     { name: 'guess', description: '開始終極密碼遊戲 (1-100)' },
-    { name: 'hl', description: '開始高低牌遊戲 (按鈕互動版)' },
+    { name: 'hl', description: '開始高低牌遊戲 (按鈕版)' },
     { 
         name: 'setup-role', 
-        description: '設置身份組領取按鈕 (僅限管理員)',
+        description: '設置身份組切換按鈕 (管理員專用)',
         default_member_permissions: PermissionFlagsBits.Administrator.toString()
     },
-    { name: 'vibe', description: '檢查機器人狀態' },
-    { name: 'stop', description: '停止所有遊戲' }
+    { name: 'vibe', description: '檢查系統狀態' },
+    { name: 'stop', description: '停止所有進行中的遊戲' }
 ];
 
+// 註冊指令
 async function registerCommands() {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-        console.log('✅ 所有斜線指令已註冊');
-    } catch (error) { console.error(error); }
+        console.log('✅ 所有斜線指令已同步成功');
+    } catch (error) { console.error('註冊失敗:', error); }
 }
 
 client.on('ready', () => {
-    console.log(`🤖 機器人已上線：${client.user.tag}`);
-    client.user.setActivity('極速 Vibe 遊戲中', { type: ActivityType.Competing });
+    console.log(`🚀 ${client.user.tag} 已在 Koyeb 啟動`);
+    client.user.setActivity('極速遊戲 Vibe ⚡', { type: ActivityType.Playing });
     registerCommands();
 });
 
-// --- 5. 統一處理 Interaction (指令與按鈕) ---
+// --- 5. 統一處理互動 (指令與按鈕) ---
 client.on('interactionCreate', async interaction => {
     
-    // A. 處理斜線指令
+    // A. 斜線指令邏輯
     if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 
-        if (commandName === 'vibe') return await interaction.reply('⚡ 引擎狀態：極速響應中 (Koyeb 驅動)');
+        if (commandName === 'vibe') return await interaction.reply('⚡ 引擎狀態：完美流動中');
 
         if (commandName === 'stop') {
             gameData.counting.active = false;
             gameData.guess.active = false;
             gameData.hl.active = false;
-            return await interaction.reply('🛑 所有遊戲已強制停止並重置。');
+            return await interaction.reply('🛑 所有遊戲已重置。');
         }
 
         if (commandName === 'counting') {
             gameData.counting = { active: true, current: 0, lastUser: null };
-            return await interaction.reply('🎮 **Counting 開始！** 請直接輸入 **1** 開始接力數數。');
+            return await interaction.reply('🎮 **Counting 開始！** 請直接輸入 **1** 開始接力。');
         }
 
         if (commandName === 'guess') {
@@ -88,59 +89,53 @@ client.on('interactionCreate', async interaction => {
                 new ButtonBuilder().setCustomId('hl_high').setLabel('大 (Higher)').setStyle(ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId('hl_low').setLabel('小 (Lower)').setStyle(ButtonStyle.Secondary)
             );
-            return await interaction.reply({ content: `🃏 **高低牌**\n當前數字：**[ ${gameData.hl.lastCard} ]**\n請猜測下一張牌會更大還是更小？`, components: [row] });
+            return await interaction.reply({ content: `🃏 **高低牌**\n當前數字：**[ ${gameData.hl.lastCard} ]**`, components: [row] });
         }
 
         if (commandName === 'setup-role') {
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
-                    .setCustomId('role_vibe_gamer')
-                    .setLabel('領取/取消 Vibe 玩家身份組')
+                    .setCustomId('toggle_vibe_role')
+                    .setLabel('領取 / 取消 Vibe Gamer 身份組')
                     .setStyle(ButtonStyle.Success)
                     .setEmoji('🎮')
             );
             return await interaction.reply({ 
-                content: '✨ **身份組領取中心**\n點擊下方按鈕即可**新增**或**取消**你的身份組！', 
+                content: '✨ **身份組領取中心**\n點擊下方按鈕領取身份組，再次點擊即可移除。', 
                 components: [row] 
             });
         }
     }
 
-    // B. 處理按鈕點擊 (身份組切換核心邏輯)
+    // B. 按鈕互動邏輯 (身份組切換 + 遊戲)
     if (interaction.isButton()) {
-        // 身份組按鈕邏輯
-        if (interaction.customId === 'role_vibe_gamer') {
-            const roleName = 'Vibe Gamer'; // 確保伺服器有這個名字的身份組
+        
+        // 身份組自助切換：點一下新增，點一下取消
+        if (interaction.customId === 'toggle_vibe_role') {
+            const roleName = 'Vibe Gamer'; // 請確保伺服器有這個名字的身份組
             const role = interaction.guild.roles.cache.find(r => r.name === roleName);
 
-            if (!role) {
-                return await interaction.reply({ content: `❌ 找不到身份組 "${roleName}"，請管理員先建立它。`, ephemeral: true });
-            }
+            if (!role) return await interaction.reply({ content: `❌ 找不到身份組 "${roleName}"，請先建立它。`, ephemeral: true });
 
             try {
-                // 判斷成員是否已經有該身份組
                 if (interaction.member.roles.cache.has(role.id)) {
-                    // 如果有，就移除 (取消)
                     await interaction.member.roles.remove(role);
                     await interaction.reply({ content: `👋 已成功**取消**你的 **${roleName}** 身份組。`, ephemeral: true });
                 } else {
-                    // 如果沒有，就新增 (領取)
                     await interaction.member.roles.add(role);
                     await interaction.reply({ content: `✅ 已成功**新增**你的 **${roleName}** 身份組！`, ephemeral: true });
                 }
-            } catch (error) {
-                console.error(error);
-                await interaction.reply({ content: '❌ 權限錯誤！請確保機器人的身份組排序高於目標身份組。', ephemeral: true });
+            } catch (err) {
+                await interaction.reply({ content: '❌ 機器人權限不足！請將機器人的身份組順序拉到最高。', ephemeral: true });
             }
         }
 
-        // 高低牌遊戲按鈕邏輯
+        // 高低牌遊戲邏輯
         if (interaction.customId.startsWith('hl_')) {
-            if (!gameData.hl.active) return await interaction.reply({ content: '遊戲已結束。', ephemeral: true });
+            if (!gameData.hl.active) return await interaction.reply({ content: '遊戲已結束', ephemeral: true });
             const nextCard = Math.floor(Math.random() * 13) + 1;
-            const isHigher = interaction.customId === 'hl_high';
-            const win = (isHigher && nextCard >= gameData.hl.lastCard) || (!isHigher && nextCard <= gameData.hl.lastCard);
-
+            const win = (interaction.customId === 'hl_high' && nextCard >= gameData.hl.lastCard) || (interaction.customId === 'hl_low' && nextCard <= gameData.hl.lastCard);
+            
             if (win) {
                 gameData.hl.lastCard = nextCard;
                 const row = new ActionRowBuilder().addComponents(
@@ -156,10 +151,11 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// --- 6. 處理文字訊息遊戲 (Counting & Guess) ---
+// --- 6. 處理文字訊息 (數數遊戲與終極密碼) ---
 client.on('messageCreate', async msg => {
     if (msg.author.bot) return;
 
+    // Counting 接力邏輯
     if (gameData.counting.active) {
         const num = parseInt(msg.content);
         if (!isNaN(num) && /^\d+$/.test(msg.content)) {
@@ -168,29 +164,31 @@ client.on('messageCreate', async msg => {
                 gameData.counting.lastUser = msg.author.id;
                 await msg.react('✅');
             } else {
-                await msg.reply(`❌ 數錯或連數了！結束於：${gameData.counting.current}`);
+                await msg.reply(`❌ 遊戲結束！數錯或連數了。最後紀錄：${gameData.counting.current}`);
                 gameData.counting.active = false;
             }
         }
     }
 
+    // 終極密碼邏輯
     if (gameData.guess.active) {
         const num = parseInt(msg.content);
         if (!isNaN(num) && /^\d+$/.test(msg.content)) {
             const { answer, min, max } = gameData.guess;
-            if (num <= min || num >= max) return;
+            if (num <= min || num >= max) return; // 超出範圍則忽略
             if (num === answer) {
                 await msg.reply(`🎊 猜中了！答案是 **${answer}**`);
                 gameData.guess.active = false;
             } else if (num < answer) {
                 gameData.guess.min = num;
-                await msg.reply(`📈 太小！範圍：**${gameData.guess.min} ~ ${gameData.guess.max}**`);
+                await msg.reply(`📈 太小了！範圍變為：**${gameData.guess.min} ~ ${gameData.guess.max}**`);
             } else {
                 gameData.guess.max = num;
-                await msg.reply(`📉 太大！範圍：**${gameData.guess.min} ~ ${gameData.guess.max}**`);
+                await msg.reply(`📉 太大了！範圍變為：**${gameData.guess.min} ~ ${gameData.guess.max}**`);
             }
         }
     }
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
