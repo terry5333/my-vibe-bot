@@ -1,8 +1,8 @@
 /**
- * Intents（必做）
- * Developer Portal → Bot → Privileged Gateway Intents：
- *  - ✅ MESSAGE CONTENT INTENT（必開：messageCreate 才能讀數字）
- *  - ✅ SERVER MEMBERS INTENT（建議：setup-role 更穩）
+ * ✅ Discord Developer Portal Intents（必開）
+ * Developer Portal → Applications → Bot → Privileged Gateway Intents
+ *  - ✅ MESSAGE CONTENT INTENT（必開：messageCreate 才能讀玩家輸入）
+ *  - ✅ SERVER MEMBERS INTENT（建議：VIP/role 功能更穩）
  */
 
 "use strict";
@@ -23,7 +23,7 @@ const {
 const admin = require("firebase-admin");
 
 // =========================
-// Express (keep-alive + Admin page)
+// Express
 // =========================
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -31,14 +31,8 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 app.get("/", (_req, res) => res.status(200).send("OK"));
+app.listen(PORT, () => console.log(`[Express] Listening on :${PORT}`));
 
-function requireAdminToken(req) {
-  const expected = process.env.ADMIN_TOKEN || "";
-  const token =
-    (req.query.token || "") ||
-    (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  return !!expected && token === expected;
-}
 function esc(s) {
   return String(s ?? "")
     .replaceAll("&", "&amp;")
@@ -47,7 +41,28 @@ function esc(s) {
     .replaceAll('"', "&quot;");
 }
 
-app.listen(PORT, () => console.log(`[Express] Listening on :${PORT}`));
+// --- Basic Auth for /admin
+function basicAuth(req, res, next) {
+  const user = process.env.ADMIN_USER || "";
+  const pass = process.env.ADMIN_PASS || "";
+  if (!user || !pass) return res.status(500).send("Admin auth not configured (ADMIN_USER/ADMIN_PASS).");
+
+  const header = req.headers.authorization || "";
+  const [type, token] = header.split(" ");
+  if (type !== "Basic" || !token) {
+    res.set("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).send("Unauthorized");
+  }
+  const decoded = Buffer.from(token, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const u = idx >= 0 ? decoded.slice(0, idx) : "";
+  const p = idx >= 0 ? decoded.slice(idx + 1) : "";
+  if (u !== user || p !== pass) {
+    res.set("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).send("Unauthorized");
+  }
+  next();
+}
 
 // =========================
 // Discord Client
@@ -57,7 +72,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // ✅ 必須
-    GatewayIntentBits.GuildMembers, // ✅ 建議
+    GatewayIntentBits.GuildMembers,   // ✅ 建議
   ],
   partials: [Partials.Channel],
 });
@@ -109,6 +124,80 @@ function initFirebase() {
   }
 }
 initFirebase();
+
+// =========================
+// Config in Firebase (VIP / Weekly)
+// =========================
+const DEFAULT_CONFIG = Object.freeze({
+  vip: {
+    enabled: false,
+    guildId: "",
+    roleId: "",
+    threshold: 1000,
+  },
+  weekly: {
+    enabled: false,
+    topN: 3,
+    reward: 100,
+    // 你想要手動重置本週發放鎖時，可以清掉 weeklyLocks/currentWeekKey
+  },
+});
+
+const configCache = {
+  value: { ...DEFAULT_CONFIG, vip: { ...DEFAULT_CONFIG.vip }, weekly: { ...DEFAULT_CONFIG.weekly } },
+  updatedAt: 0,
+};
+
+function normalizeConfig(raw) {
+  const vip = raw?.vip || {};
+  const weekly = raw?.weekly || {};
+  return {
+    vip: {
+      enabled: !!vip.enabled,
+      guildId: String(vip.guildId || ""),
+      roleId: String(vip.roleId || ""),
+      threshold: Math.max(1, Number(vip.threshold || DEFAULT_CONFIG.vip.threshold)),
+    },
+    weekly: {
+      enabled: !!weekly.enabled,
+      topN: Math.max(1, Number(weekly.topN || DEFAULT_CONFIG.weekly.topN)),
+      reward: Math.max(1, Number(weekly.reward || DEFAULT_CONFIG.weekly.reward)),
+    },
+  };
+}
+
+async function loadConfigOnce() {
+  await dbReady;
+  const snap = await db.ref("config").get();
+  const cfg = normalizeConfig(snap.val() || {});
+  configCache.value = cfg;
+  configCache.updatedAt = Date.now();
+  return cfg;
+}
+
+function getConfig() {
+  return configCache.value;
+}
+
+// 監聽 config 變更，網頁改完幾秒內自動生效
+(async () => {
+  try {
+    await dbReady;
+    await loadConfigOnce();
+    db.ref("config").on(
+      "value",
+      (snap) => {
+        const cfg = normalizeConfig(snap.val() || {});
+        configCache.value = cfg;
+        configCache.updatedAt = Date.now();
+        console.log("[Config] Updated from Firebase");
+      },
+      (err) => console.error("[Config] listener error:", err)
+    );
+  } catch (e) {
+    console.error("[Config] init error:", e);
+  }
+})();
 
 // =========================
 // Cache (rank 秒回)
@@ -163,6 +252,9 @@ async function addPoints(userId, amount) {
   const newPts = Number(result.snapshot.val()) || 0;
   userPointsCache.set(userId, newPts);
   bumpLeaderboardCache(userId, newPts);
+
+  // ✅ VIP role auto assign (依 Firebase config)
+  maybeAssignVipRole(userId, newPts).catch(() => {});
   return newPts;
 }
 
@@ -178,39 +270,54 @@ async function getPoints(userId) {
 }
 
 // =========================
+// VIP Role Auto Assign (config in Firebase)
+// =========================
+async function maybeAssignVipRole(userId, points) {
+  const cfg = getConfig().vip;
+  if (!cfg.enabled) return;
+  if (!cfg.guildId || !cfg.roleId) return;
+  if (points < Number(cfg.threshold || 1)) return;
+
+  const guildId = cfg.guildId;
+  const roleId = cfg.roleId;
+
+  const guild = client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null));
+  if (!guild) return;
+
+  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  if (!me) return;
+
+  if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) return;
+  const role = guild.roles.cache.get(roleId) || (await guild.roles.fetch(roleId).catch(() => null));
+  if (!role) return;
+  if (me.roles.highest.comparePositionTo(role) <= 0) return;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return;
+  if (member.roles.cache.has(roleId)) return;
+
+  await member.roles.add(roleId).catch(() => {});
+}
+
+// =========================
 // Game State
 // =========================
-// ✅ 同一頻道「數字遊戲」只能有一個：guess 或 counting
-const guessGame = new Map(); // channelId -> { active, answer, min, max }
-const countingGame = new Map(); // channelId -> { active, start, next, lastUserId, reward, guildId }
-const hlGame = new Map(); // userId -> { current, streak }
+const guessGame = new Map();     // channelId -> { active, answer, min, max }
+const countingGame = new Map();  // channelId -> { active, start, next, lastUserId, reward, guildId }
+const hlGame = new Map();        // userId -> { current, streak }
 
-// counting persistence
+function isGuessActive(channelId) { return !!guessGame.get(channelId)?.active; }
+function isCountingActive(channelId) { return !!countingGame.get(channelId)?.active; }
+
 const COUNTING_PATH = "counting";
-const countingStoppedAt = new Map(); // channelId -> timestamp (避免 stop 後又被 DB load 回來)
-const STOP_BLOCK_MS = 60_000; // 停止後 60 秒內不再從 DB 重新載入
+const countingStoppedAt = new Map();
+const STOP_BLOCK_MS = 60_000;
 
-function isGuessActive(channelId) {
-  const g = guessGame.get(channelId);
-  return !!g?.active;
-}
-function isCountingActive(channelId) {
-  const c = countingGame.get(channelId);
-  return !!c?.active;
-}
-function anyNumberGameActive(channelId) {
-  return isGuessActive(channelId) || isCountingActive(channelId);
-}
-
-// =========================
-// Counting DB helpers
-// =========================
 async function loadCountingState(guildId, channelId) {
   await dbReady;
   const snap = await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).get();
   const v = snap.val();
   if (!v || !v.active) return null;
-
   return {
     active: true,
     start: Number(v.start) || 1,
@@ -239,6 +346,92 @@ async function stopCountingState(guildId, channelId) {
     active: false,
     updatedAt: Date.now(),
   });
+}
+
+// =========================
+// Helpers
+// =========================
+function randInt(min, max) {
+  const a = Math.min(min, max);
+  const b = Math.max(min, max);
+  return Math.floor(Math.random() * (b - a + 1)) + a;
+}
+
+function makeHLButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("hl:higher").setLabel("Higher").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("hl:lower").setLabel("Lower").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("hl:stop").setLabel("Stop").setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+function isAdminMember(interaction) {
+  if (!interaction.inGuild()) return false;
+  const m = interaction.member;
+  return (
+    m?.permissions?.has?.(PermissionsBitField.Flags.Administrator) ||
+    m?.permissions?.has?.(PermissionsBitField.Flags.ManageGuild)
+  );
+}
+
+// =========================
+// Weekly Rewards (config in Firebase)
+// =========================
+function isoWeekKey(date = new Date()) {
+  // ISO week key like 2026-W07
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  const y = d.getUTCFullYear();
+  const w = String(weekNo).padStart(2, "0");
+  return `${y}-W${w}`;
+}
+
+async function getTopN(n) {
+  await dbReady;
+  const snap = await db.ref("points").orderByValue().limitToLast(n).get();
+  const val = snap.val() || {};
+  return Object.entries(val)
+    .map(([userId, points]) => ({ userId, points: Number(points) || 0 }))
+    .sort((a, b) => b.points - a.points);
+}
+
+async function payoutWeeklyTop() {
+  const cfg = getConfig().weekly;
+  if (!cfg.enabled) return { ok: false, msg: "Weekly 未啟用（請到管理頁啟用）" };
+
+  const topN = Math.max(1, Number(cfg.topN || 3));
+  const reward = Math.max(1, Number(cfg.reward || 100));
+
+  const top = await getTopN(topN);
+  if (!top.length) return { ok: false, msg: "目前沒有任何分數資料。" };
+
+  const weekKey = isoWeekKey(new Date());
+  const lockRef = db.ref(`weeklyLocks/${weekKey}`);
+  const lockSnap = await lockRef.get();
+  if (lockSnap.exists()) {
+    return { ok: false, msg: `本週（${weekKey}）已發放過。` };
+  }
+
+  const results = [];
+  for (const r of top) {
+    const newPts = await addPoints(r.userId, reward);
+    results.push({ ...r, newPts });
+  }
+
+  await lockRef.set({
+    weekKey,
+    reward,
+    topN,
+    issuedAt: Date.now(),
+    winners: results.map((x) => ({ userId: x.userId, before: x.points, after: x.newPts })),
+  });
+
+  return { ok: true, results, weekKey, reward, topN };
 }
 
 // =========================
@@ -274,6 +467,12 @@ const commandJSON = [
     .setDescription("產生身分組切換按鈕（有則移除，無則加入）")
     .addRoleOption((o) => o.setName("role").setDescription("要切換的身分組").setRequired(true))
     .addStringOption((o) => o.setName("label").setDescription("按鈕文字（可選）").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("weekly")
+    .setDescription("每週排行獎勵（管理員）")
+    .addSubcommand((s) => s.setName("preview").setDescription("預覽本週 Top 並顯示獎勵"))
+    .addSubcommand((s) => s.setName("payout").setDescription("發放本週獎勵（只允許一次）")),
 ].map((c) => c.toJSON());
 
 async function registerCommandsOnce() {
@@ -286,7 +485,6 @@ async function registerCommandsOnce() {
     console.warn("[Commands] Missing DISCORD_TOKEN or DISCORD_CLIENT_ID, skip.");
     return;
   }
-
   if (String(process.env.REGISTER_COMMANDS).toLowerCase() !== "true") {
     console.log("[Commands] REGISTER_COMMANDS != true, skip registering.");
     return;
@@ -302,32 +500,12 @@ async function registerCommandsOnce() {
 }
 
 // =========================
-// HL helpers
-// =========================
-function randInt(min, max) {
-  const a = Math.min(min, max);
-  const b = Math.max(min, max);
-  return Math.floor(Math.random() * (b - a + 1)) + a;
-}
-
-function makeHLButtons() {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("hl:higher").setLabel("Higher").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("hl:lower").setLabel("Lower").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("hl:stop").setLabel("Stop").setStyle(ButtonStyle.Secondary)
-    ),
-  ];
-}
-
-// =========================
-// Admin Web Page (View + Adjust + Force Stop)
+// Admin Dashboard (settings editable)
 // =========================
 async function listCountingActiveFromDB() {
   await dbReady;
   const snap = await db.ref(COUNTING_PATH).get();
   const root = snap.val() || {};
-  // root: { guildId: { channelId: { active, next, ... } } }
   const rows = [];
   for (const [guildId, channels] of Object.entries(root)) {
     if (!channels) continue;
@@ -349,18 +527,10 @@ async function listCountingActiveFromDB() {
   return rows;
 }
 
-app.get("/admin", async (req, res) => {
-  if (!requireAdminToken(req)) return res.status(401).send("Unauthorized");
+app.get("/admin", basicAuth, async (_req, res) => {
   await dbReady;
 
-  const token = esc(req.query.token || "");
-  const qUserId = String(req.query.userId || "").trim();
-
-  let userPoints = null;
-  if (qUserId) {
-    const snap = await db.ref(`points/${qUserId}`).get();
-    userPoints = Number(snap.val()) || 0;
-  }
+  const cfg = getConfig();
 
   const snap = await db.ref("points").orderByValue().limitToLast(50).get();
   const val = snap.val() || {};
@@ -392,40 +562,58 @@ app.get("/admin", async (req, res) => {
     table { border-collapse: collapse; width: 100%; }
     th, td { border: 1px solid #ddd; padding: 8px; }
     th { background: #f5f5f5; text-align: left; }
-    input { padding: 8px; width: 360px; max-width: 100%; }
+    input { padding: 8px; width: 340px; max-width: 100%; }
     button { padding: 8px 12px; cursor: pointer; }
     code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
     .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .small { font-size: 12px; color:#666; }
+    label { display:inline-flex; gap:6px; align-items:center; }
   </style>
 </head>
 <body>
-  <h2>Admin</h2>
+  <h2>Admin Dashboard</h2>
 
   <div class="box">
-    <div>開啟方式：<code>/admin?token=ADMIN_TOKEN</code></div>
-    <div>查詢玩家：<code>/admin?token=...&userId=...</code></div>
+    <h3>VIP / Weekly 設定（存在 Firebase，改完立即生效）</h3>
+
+    <h4>VIP 設定</h4>
+    <form method="POST" action="/admin/settings" class="row">
+      <input type="hidden" name="section" value="vip" />
+      <label><input type="checkbox" name="enabled" ${cfg.vip.enabled ? "checked" : ""}/> 啟用</label>
+      <input name="guildId" placeholder="VIP Guild ID" value="${esc(cfg.vip.guildId)}" />
+      <input name="roleId" placeholder="VIP Role ID" value="${esc(cfg.vip.roleId)}" />
+      <input name="threshold" placeholder="VIP Threshold" value="${esc(cfg.vip.threshold)}" />
+      <button type="submit">保存 VIP</button>
+    </form>
+    <div class="small">注意：Bot 需要 Manage Roles，且 Bot 身分組順序要高於 VIP role。</div>
+
+    <hr/>
+
+    <h4>Weekly 設定</h4>
+    <form method="POST" action="/admin/settings" class="row">
+      <input type="hidden" name="section" value="weekly" />
+      <label><input type="checkbox" name="enabled" ${cfg.weekly.enabled ? "checked" : ""}/> 啟用</label>
+      <input name="topN" placeholder="Top N" value="${esc(cfg.weekly.topN)}" />
+      <input name="reward" placeholder="Reward points" value="${esc(cfg.weekly.reward)}" />
+      <button type="submit">保存 Weekly</button>
+    </form>
+
+    <form method="POST" action="/admin/reset-weekly-lock" class="row" style="margin-top:10px;">
+      <button type="submit">重置「本週已發放」鎖（必要時才按）</button>
+      <span class="small">本週 Key：<code>${esc(isoWeekKey(new Date()))}</code></span>
+    </form>
   </div>
 
   <div class="box">
-    <h3>查詢玩家</h3>
-    <form method="GET" action="/admin">
-      <input type="hidden" name="token" value="${token}" />
-      <input name="userId" placeholder="Discord User ID" value="${esc(qUserId)}" />
+    <h3>查詢玩家 / 加扣分</h3>
+    <form method="POST" action="/admin/lookup" class="row">
+      <input name="userId" placeholder="Discord User ID" required />
       <button type="submit">查詢</button>
     </form>
-    ${
-      qUserId
-        ? `<p>userId: <code>${esc(qUserId)}</code> points: <b>${userPoints}</b></p>`
-        : `<p>輸入 userId 查詢單人分數</p>`
-    }
-  </div>
-
-  <div class="box">
-    <h3>加分 / 扣分（扣分用負數）</h3>
-    <form method="POST" action="/admin/adjust?token=${token}">
-      <div><input name="userId" placeholder="Discord User ID" required /></div><br/>
-      <div><input name="amount" placeholder="Amount (e.g. 50 or -10)" required /></div><br/>
+    <br/>
+    <form method="POST" action="/admin/adjust" class="row">
+      <input name="userId" placeholder="Discord User ID" required />
+      <input name="amount" placeholder="Amount (e.g. 50 or -10)" required />
       <button type="submit">送出</button>
     </form>
   </div>
@@ -441,7 +629,7 @@ app.get("/admin", async (req, res) => {
                  <td><code>${esc(r.channelId)}</code></td>
                  <td>${r.min} ~ ${r.max}</td>
                  <td>
-                   <form method="POST" action="/admin/force-stop?token=${token}" class="row">
+                   <form method="POST" action="/admin/force-stop" class="row">
                      <input type="hidden" name="type" value="guess"/>
                      <input type="hidden" name="channelId" value="${esc(r.channelId)}"/>
                      <button type="submit">強制停止</button>
@@ -451,7 +639,7 @@ app.get("/admin", async (req, res) => {
              )
              .join("")}
           </table>`
-        : `<p class="small">目前沒有 Guess 房間（重啟 bot 會清空記憶體狀態）</p>`
+        : `<p class="small">目前沒有 Guess 房間（bot 重啟會清空記憶體狀態）</p>`
     }
   </div>
 
@@ -469,7 +657,7 @@ app.get("/admin", async (req, res) => {
                  <td>+${r.reward}</td>
                  <td>${r.lastUserId ? `<code>${esc(r.lastUserId)}</code>` : ""}</td>
                  <td>
-                   <form method="POST" action="/admin/force-stop?token=${token}" class="row">
+                   <form method="POST" action="/admin/force-stop" class="row">
                      <input type="hidden" name="type" value="counting"/>
                      <input type="hidden" name="guildId" value="${esc(r.guildId)}"/>
                      <input type="hidden" name="channelId" value="${esc(r.channelId)}"/>
@@ -496,7 +684,7 @@ app.get("/admin", async (req, res) => {
                  <td>${p.current}</td>
                  <td>${p.streak}</td>
                  <td>
-                   <form method="POST" action="/admin/force-stop?token=${token}" class="row">
+                   <form method="POST" action="/admin/force-stop" class="row">
                      <input type="hidden" name="type" value="hl"/>
                      <input type="hidden" name="userId" value="${esc(p.userId)}"/>
                      <button type="submit">強制停止</button>
@@ -506,7 +694,7 @@ app.get("/admin", async (req, res) => {
              )
              .join("")}
           </table>`
-        : `<p class="small">目前沒有 HL 遊戲（重啟 bot 會清空記憶體狀態）</p>`
+        : `<p class="small">目前沒有 HL 遊戲（bot 重啟會清空記憶體狀態）</p>`
     }
   </div>
 
@@ -522,31 +710,73 @@ app.get("/admin", async (req, res) => {
         .join("")}
     </table>
   </div>
+
 </body>
 </html>`);
 });
 
-app.post("/admin/adjust", async (req, res) => {
-  if (!requireAdminToken(req)) return res.status(401).send("Unauthorized");
+app.post("/admin/settings", basicAuth, async (req, res) => {
+  await dbReady;
+  const section = String(req.body.section || "");
 
+  try {
+    if (section === "vip") {
+      const enabled = !!req.body.enabled;
+      const guildId = String(req.body.guildId || "").trim();
+      const roleId = String(req.body.roleId || "").trim();
+      const threshold = Math.max(1, Number(req.body.threshold || DEFAULT_CONFIG.vip.threshold));
+
+      await db.ref("config/vip").set({ enabled, guildId, roleId, threshold });
+    } else if (section === "weekly") {
+      const enabled = !!req.body.enabled;
+      const topN = Math.max(1, Number(req.body.topN || DEFAULT_CONFIG.weekly.topN));
+      const reward = Math.max(1, Number(req.body.reward || DEFAULT_CONFIG.weekly.reward));
+
+      await db.ref("config/weekly").set({ enabled, topN, reward });
+    }
+  } catch (e) {
+    console.error("[AdminSettings] Failed:", e);
+  }
+
+  res.redirect("/admin");
+});
+
+app.post("/admin/reset-weekly-lock", basicAuth, async (_req, res) => {
+  await dbReady;
+  const weekKey = isoWeekKey(new Date());
+  try {
+    await db.ref(`weeklyLocks/${weekKey}`).remove();
+  } catch (e) {
+    console.error("[AdminResetWeeklyLock] Failed:", e);
+  }
+  res.redirect("/admin");
+});
+
+app.post("/admin/lookup", basicAuth, async (req, res) => {
+  await dbReady;
+  const userId = String(req.body.userId || "").trim();
+  if (!userId) return res.status(400).send("Missing userId");
+  const pts = await getPoints(userId);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<p>User: <code>${esc(userId)}</code></p><p>Points: <b>${pts}</b></p><p><a href="/admin">Back</a></p>`);
+});
+
+app.post("/admin/adjust", basicAuth, async (req, res) => {
   const userId = String(req.body.userId || "").trim();
   const amount = Number(req.body.amount);
-
   if (!userId) return res.status(400).send("Missing userId");
   if (!Number.isFinite(amount) || amount === 0) return res.status(400).send("Invalid amount");
 
   try {
     await addPoints(userId, amount);
-    return res.redirect(`/admin?token=${encodeURIComponent(req.query.token)}&userId=${encodeURIComponent(userId)}`);
+    return res.redirect("/admin");
   } catch (e) {
     console.error("[AdminAdjust] Failed:", e);
     return res.status(500).send("Adjust failed");
   }
 });
 
-app.post("/admin/force-stop", async (req, res) => {
-  if (!requireAdminToken(req)) return res.status(401).send("Unauthorized");
-
+app.post("/admin/force-stop", basicAuth, async (req, res) => {
   const type = String(req.body.type || "");
   try {
     if (type === "guess") {
@@ -567,7 +797,7 @@ app.post("/admin/force-stop", async (req, res) => {
   } catch (e) {
     console.error("[AdminForceStop] Failed:", e);
   }
-  return res.redirect(`/admin?token=${encodeURIComponent(req.query.token)}`);
+  return res.redirect("/admin");
 });
 
 // =========================
@@ -577,6 +807,7 @@ client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
   await registerCommandsOnce();
   await refreshLeaderboardCache();
+  await loadConfigOnce().catch(() => {});
 });
 
 // =========================
@@ -584,7 +815,6 @@ client.once("ready", async () => {
 // =========================
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ---- Slash commands ----
     if (interaction.isChatInputCommand()) {
       const name = interaction.commandName;
 
@@ -606,8 +836,6 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ ephemeral: false });
 
         const channelId = interaction.channelId;
-
-        // ✅ 防混：counting 正在跑就不給開 guess
         if (isCountingActive(channelId)) {
           return interaction.editReply("此頻道正在進行 Counting，請先用 `/counting stop` 停止後再開 `/guess`。");
         }
@@ -621,7 +849,6 @@ client.on("interactionCreate", async (interaction) => {
         const max = interaction.options.getInteger("max") ?? 100;
         const realMin = Math.min(min, max);
         const realMax = Math.max(min, max);
-
         if (realMax - realMin < 2) {
           return interaction.editReply("範圍太小，至少要像 1~3（答案才可能在中間，不含邊界）。");
         }
@@ -647,29 +874,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      if (name === "setup-role") {
-        await interaction.deferReply({ ephemeral: true });
-
-        if (!interaction.inGuild()) return interaction.editReply("此指令只能在伺服器使用。");
-
-        const role = interaction.options.getRole("role");
-        const label = interaction.options.getString("label") || `切換身分組：${role.name}`;
-
-        const me = interaction.guild.members.me;
-        if (!me) return interaction.editReply("讀不到我的成員資訊，請稍後再試。");
-
-        if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-          return interaction.editReply("我沒有 **Manage Roles** 權限。");
-        }
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`role:toggle:${role.id}`).setLabel(label).setStyle(ButtonStyle.Primary)
-        );
-
-        await interaction.channel.send({ content: `🔘 點按鈕切換：<@&${role.id}>`, components: [row] });
-        return interaction.editReply("已送出身分組切換按鈕。");
-      }
-
       if (name === "counting") {
         if (!interaction.inGuild()) {
           return interaction.reply({ content: "此指令只能在伺服器使用。", ephemeral: true });
@@ -682,14 +886,12 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ ephemeral: true });
 
         if (sub === "start") {
-          // ✅ 防混：guess 正在跑就不給開 counting
           if (isGuessActive(channelId)) {
             return interaction.editReply("此頻道正在進行 Guess，請先結束（猜中或管理員強制停止）後再開 counting。");
           }
 
           const start = interaction.options.getInteger("start") ?? 1;
           const reward = interaction.options.getInteger("reward") ?? 1;
-
           if (!Number.isInteger(start)) return interaction.editReply("start 必須是整數。");
           if (!Number.isInteger(reward) || reward <= 0) return interaction.editReply("reward 必須是正整數。");
 
@@ -698,21 +900,17 @@ client.on("interactionCreate", async (interaction) => {
           countingStoppedAt.delete(channelId);
 
           await saveCountingState(guildId, channelId, state);
-
           await interaction.channel.send(
-            `🔢 Counting 已啟動！請從 **${start}** 開始。\n規則：同一人不能連續｜正確 +${reward} 分（會顯示總分）`
+            `🔢 Counting 已啟動！請從 **${start}** 開始。\n規則：同一人不能連續｜正確 +${reward} 分`
           );
           return interaction.editReply("已啟動 counting。");
         }
 
         if (sub === "stop") {
-          // ✅ 完整停止：記憶體刪除 + DB active:false + stop block
           const cur = countingGame.get(channelId);
           countingGame.delete(channelId);
           countingStoppedAt.set(channelId, Date.now());
-
           await stopCountingState(guildId, channelId);
-
           await interaction.channel.send("🛑 Counting 已停止。");
           return interaction.editReply(cur?.active ? "已停止 counting。" : "已停止（或本來就沒在跑）");
         }
@@ -724,13 +922,60 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply(`✅ Counting 啟用中\n下一個：**${s.next}**｜reward：+${s.reward}`);
         }
       }
+
+      if (name === "setup-role") {
+        await interaction.deferReply({ ephemeral: true });
+        if (!interaction.inGuild()) return interaction.editReply("此指令只能在伺服器使用。");
+
+        const role = interaction.options.getRole("role");
+        const label = interaction.options.getString("label") || `切換身分組：${role.name}`;
+
+        const me = interaction.guild.members.me;
+        if (!me) return interaction.editReply("讀不到我的成員資訊，請稍後再試。");
+        if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+          return interaction.editReply("我沒有 **Manage Roles** 權限。");
+        }
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`role:toggle:${role.id}`).setLabel(label).setStyle(ButtonStyle.Primary)
+        );
+
+        await interaction.channel.send({ content: `🔘 點按鈕切換：<@&${role.id}>`, components: [row] });
+        return interaction.editReply("已送出身分組切換按鈕。");
+      }
+
+      if (name === "weekly") {
+        if (!isAdminMember(interaction)) {
+          return interaction.reply({ content: "只有管理員可以使用。", ephemeral: true });
+        }
+
+        const sub = interaction.options.getSubcommand();
+        await interaction.deferReply({ ephemeral: false });
+
+        if (sub === "preview") {
+          const cfg = getConfig().weekly;
+          if (!cfg.enabled) return interaction.editReply("Weekly 未啟用（請到管理頁啟用）");
+          const top = await getTopN(Math.max(1, Number(cfg.topN || 3)));
+          if (!top.length) return interaction.editReply("目前沒有任何分數資料。");
+          const lines = top.map((x, i) => `**#${i + 1}** <@${x.userId}> — ${x.points}`);
+          return interaction.editReply(
+            `📅 本週預覽 Top ${cfg.topN}\n${lines.join("\n")}\n\n發放獎勵：每人 +${cfg.reward} 分（用 /weekly payout）`
+          );
+        }
+
+        if (sub === "payout") {
+          const out = await payoutWeeklyTop();
+          if (!out.ok) return interaction.editReply(`❌ ${out.msg}`);
+          const lines = out.results.map((x, i) => `**#${i + 1}** <@${x.userId}> ✅ +${out.reward}（新總分：${x.newPts}）`);
+          return interaction.editReply(`🎉 已發放（${out.weekKey}）\n${lines.join("\n")}`);
+        }
+      }
     }
 
-    // ---- Buttons ----
+    // Buttons
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // HL buttons
       if (id.startsWith("hl:")) {
         const userId = interaction.user.id;
         const state = hlGame.get(userId);
@@ -740,7 +985,6 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const action = id.split(":")[1];
-
         if (action === "stop") {
           hlGame.delete(userId);
           return interaction.update({ content: `🛑 已結束。連勝：**${state.streak}**`, components: [] });
@@ -758,7 +1002,7 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        await interaction.deferUpdate(); // ✅ 先回應，避免按鈕沒反應
+        await interaction.deferUpdate();
 
         state.streak += 1;
         state.current = next;
@@ -774,12 +1018,11 @@ client.on("interactionCreate", async (interaction) => {
           content:
             newPts !== null
               ? `✅ 猜對！+5 分（總分：**${newPts}**）\n目前牌：**${state.current}**｜連勝：**${state.streak}**`
-              : `✅ 猜對！但加分失敗（請管理員查看 log/Firebase）\n目前牌：**${state.current}**｜連勝：**${state.streak}**`,
+              : `✅ 猜對！但加分失敗（請管理員查 log/Firebase）\n目前牌：**${state.current}**｜連勝：**${state.streak}**`,
           components: makeHLButtons(),
         });
       }
 
-      // Role toggle
       if (id.startsWith("role:toggle:")) {
         if (!interaction.inGuild()) return interaction.reply({ content: "只能在伺服器使用。", ephemeral: true });
 
@@ -848,7 +1091,7 @@ client.on("messageCreate", async (message) => {
     const channelId = message.channel.id;
     const guildId = message.guild.id;
 
-    // ========= Guess first (only if active) =========
+    // Guess active → 只處理 guess（避免跟 counting 搶數字）
     const g = guessGame.get(channelId);
     if (g?.active) {
       const t = message.content.trim();
@@ -863,10 +1106,7 @@ client.on("messageCreate", async (message) => {
 
         if (n === g.answer) {
           guessGame.delete(channelId);
-
-          // ✅ 一定先回訊息
           await message.reply(`🎉 猜中！答案是 **${g.answer}**\n正在加分中…`);
-
           try {
             const newPts = await addPoints(message.author.id, 50);
             await message.channel.send(`<@${message.author.id}> ✅ +50 分（總分：**${newPts}**）`);
@@ -887,16 +1127,12 @@ client.on("messageCreate", async (message) => {
           return;
         }
       }
-      // guess active 時，其他數字遊戲一律不處理（避免混）
       return;
     }
 
-    // ========= Counting (load from DB if needed) =========
-    // ✅ stop 後的一段時間內，不再從 DB 自動載入，避免「已停仍回覆」
+    // stop-block：剛 stop 不再從 DB 載入，避免「停了還回」
     const stoppedAt = countingStoppedAt.get(channelId);
-    if (stoppedAt && Date.now() - stoppedAt < STOP_BLOCK_MS) {
-      return;
-    }
+    if (stoppedAt && Date.now() - stoppedAt < STOP_BLOCK_MS) return;
 
     let c = countingGame.get(channelId);
     if (!c) {
@@ -927,7 +1163,6 @@ client.on("messageCreate", async (message) => {
         return;
       }
 
-      // correct
       c.lastUserId = message.author.id;
       c.next += 1;
       await saveCountingState(guildId, channelId, c);
@@ -940,7 +1175,6 @@ client.on("messageCreate", async (message) => {
         console.error("[Counting] addPoints failed:", e);
         await message.reply("✅ 數字正確，但加分失敗（請管理員查 log/Firebase）");
       }
-      return;
     }
   } catch (e) {
     console.error("[messageCreate] Error:", e);
