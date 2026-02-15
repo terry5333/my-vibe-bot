@@ -1,11 +1,11 @@
 {
   "name": "my-vibe-bot",
-  "version": "3.0.0",
-  "description": "All-in-one Discord bot + Firebase RTDB + Admin Web (JWT) + Games",
-  "main": "index.js",
+  "version": "4.0.0",
+  "description": "Discord bot + Firebase RTDB + Admin Panel (JWT) + Games + History",
+  "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/index.js"
   },
   "engines": {
     "node": ">=18"
