@@ -1,5 +1,13 @@
 "use strict";
 
+/**
+ * games.js (FULL SAFE VERSION)
+ * - Guess / Counting / HL
+ * - Firebase Logs
+ * - Points
+ * - Anti-conflict
+ */
+
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -8,302 +16,412 @@ const {
 } = require("discord.js");
 
 const { getDB } = require("../db/firebase");
-const { addPoints, getPoints } = require("../db/points");
+const { addPoints } = require("../db/points");
 const {
   upsertUserProfile,
   setActiveRoom,
   clearActiveRoom,
   appendRoomEvent,
   pushRoomEventRolling,
-  makeRoomId,
 } = require("../db/logs");
 
-function now() { return Date.now(); }
-function randInt(min, max) {
-  const a = Math.min(min, max);
-  const b = Math.max(min, max);
-  return Math.floor(Math.random() * (b - a + 1)) + a;
-}
-function isIntStr(t) { return /^-?\d+$/.test(t); }
+/* ================= Utils ================= */
 
-const DEFAULT_CONFIG = Object.freeze({
-  vip: { enabled: false, guildId: "", roleId: "", threshold: 1000 },
-  weekly: { enabled: false, topN: 3, reward: 100 },
-});
-
-const configCache = { value: JSON.parse(JSON.stringify(DEFAULT_CONFIG)) };
-
-async function initConfigListeners() {
-  const db = getDB();
-  db.ref("config").on("value", (snap) => {
-    const raw = snap.val() || {};
-    const vip = raw.vip || {};
-    const weekly = raw.weekly || {};
-    configCache.value = {
-      vip: {
-        enabled: !!vip.enabled,
-        guildId: String(vip.guildId || ""),
-        roleId: String(vip.roleId || ""),
-        threshold: Math.max(1, Number(vip.threshold || DEFAULT_CONFIG.vip.threshold)),
-      },
-      weekly: {
-        enabled: !!weekly.enabled,
-        topN: Math.max(1, Number(weekly.topN || DEFAULT_CONFIG.weekly.topN)),
-        reward: Math.max(1, Number(weekly.reward || DEFAULT_CONFIG.weekly.reward)),
-      },
-    };
-    console.log("[Config] updated");
-  });
-}
-function getConfig() { return configCache.value; }
-
-// ===== Active games =====
-const guessGame = new Map(); // channelId -> {active, answer, min, max, roomId}
-const hlGame = new Map();    // userId -> {current, streak, roomId, guildId}
-const countingGame = new Map(); // channelId -> {active, start, next, lastUserId, reward, guildId, roomId}
-const countingStoppedAt = new Map(); // channelId -> ts
-const STOP_BLOCK_MS = 60_000;
-
-const COUNTING_PATH = "counting"; // 持久狀態（用來恢復）
-
-function makeHLButtons() {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("hl:higher").setLabel("更大").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("hl:lower").setLabel("更小").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("hl:stop").setLabel("結束").setStyle(ButtonStyle.Secondary)
-    ),
-  ];
+function now() {
+  return Date.now();
 }
 
-// ===== User profile sync =====
+function rand(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isInt(t) {
+  return /^-?\d+$/.test(t);
+}
+
+/* ================= In-Memory States ================= */
+
+const guessGame = new Map();      // channelId
+const countingGame = new Map();   // channelId
+const hlGame = new Map();         // userId
+
+const STOP_BLOCK_MS = 60000;
+const stopped = new Map();        // channelId => ts
+
+/* ================= User Sync ================= */
+
 async function syncUser(user) {
-  const avatar = user.displayAvatarURL({ size: 128, extension: "png" });
-  await upsertUserProfile(user.id, { name: user.username, avatar });
+  try {
+    await upsertUserProfile(user.id, {
+      name: user.username,
+      avatar: user.displayAvatarURL(),
+    });
+  } catch {}
 }
 
-// ===== Counting persistence =====
-async function loadCountingState(guildId, channelId) {
-  const db = getDB();
-  const snap = await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).get();
-  const v = snap.val();
-  if (!v || !v.active) return null;
-  return {
-    active: true,
-    start: Number(v.start) || 1,
-    next: Number(v.next) || Number(v.start) || 1,
-    lastUserId: v.lastUserId || null,
-    reward: Number(v.reward) || 1,
-    guildId,
-    roomId: v.roomId || null,
-  };
-}
-async function saveCountingState(guildId, channelId, state) {
-  const db = getDB();
-  await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).set({
-    active: !!state.active,
-    start: state.start,
-    next: state.next,
-    lastUserId: state.lastUserId || null,
-    reward: state.reward,
-    roomId: state.roomId || null,
-    updatedAt: now(),
-  });
-}
-async function stopCountingState(guildId, channelId) {
-  const db = getDB();
-  await db.ref(`${COUNTING_PATH}/${guildId}/${channelId}`).set({
-    active: false,
-    updatedAt: now(),
-  });
-}
+/* ================= Guess ================= */
 
-// ===== VIP auto role =====
-async function maybeAssignVipRole(client, userId, points) {
-  const cfg = getConfig().vip;
-  if (!cfg.enabled) return;
-  if (!cfg.guildId || !cfg.roleId) return;
-  if (points < cfg.threshold) return;
-
-  const guild = await client.guilds.fetch(cfg.guildId).catch(() => null);
-  if (!guild) return;
-  const me = await guild.members.fetchMe().catch(() => null);
-  if (!me) return;
-  if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) return;
-
-  const role = await guild.roles.fetch(cfg.roleId).catch(() => null);
-  if (!role) return;
-  if (me.roles.highest.comparePositionTo(role) <= 0) return;
-
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) return;
-  if (member.roles.cache.has(cfg.roleId)) return;
-
-  await member.roles.add(cfg.roleId).catch(() => {});
-}
-
-// ===== Weekly payout =====
-function isoWeekKey(date = new Date()) {
-  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-  const dayNum = d.getUTCDay() || 7;
-  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
-}
-async function getTopN(n) {
-  const db = getDB();
-  const snap = await db.ref("points").orderByValue().limitToLast(n).get();
-  const val = snap.val() || {};
-  return Object.entries(val)
-    .map(([userId, pts]) => ({ userId, points: Number(pts) || 0 }))
-    .sort((a, b) => b.points - a.points);
-}
-async function payoutWeeklyTop(client) {
-  const cfg = getConfig().weekly;
-  if (!cfg.enabled) return { ok: false, msg: "每週結算未啟用（到後台啟用）" };
-
-  const top = await getTopN(cfg.topN);
-  if (!top.length) return { ok: false, msg: "目前沒有任何分數資料。" };
-
-  const db = getDB();
-  const weekKey = isoWeekKey(new Date());
-  const lockRef = db.ref(`weeklyLocks/${weekKey}`);
-  const lockSnap = await lockRef.get();
-  if (lockSnap.exists()) return { ok: false, msg: `本週（${weekKey}）已發放過。` };
-
-  const results = [];
-  for (const r of top) {
-    const newPts = await addPoints(r.userId, cfg.reward);
-    await maybeAssignVipRole(client, r.userId, newPts);
-    results.push({ ...r, newPts });
-  }
-
-  await lockRef.set({
-    weekKey,
-    reward: cfg.reward,
-    topN: cfg.topN,
-    issuedAt: now(),
-    winners: results.map((x) => ({ userId: x.userId, before: x.points, after: x.newPts })),
-  });
-
-  return { ok: true, weekKey, reward: cfg.reward, topN: cfg.topN, results };
-}
-
-// ===== Force stop from admin =====
-async function forceStopGuess(guildId, channelId) {
-  const g = guessGame.get(channelId);
-  if (g?.active) guessGame.delete(channelId);
-  await clearActiveRoom("guess", guildId, channelId);
-}
-async function forceStopHL(guildId, userId) {
-  if (hlGame.has(userId)) hlGame.delete(userId);
-  await clearActiveRoom("hl", guildId, userId);
-}
-async function forceStopCounting(guildId, channelId) {
-  countingGame.delete(channelId);
-  countingStoppedAt.set(channelId, now());
-  await stopCountingState(guildId, channelId);
-  await clearActiveRoom("counting", guildId, channelId);
-}
-
-// ===== Public API for web =====
-function getLiveRoomsSnapshot() {
-  const guess = [...guessGame.entries()].filter(([, g]) => g?.active).map(([channelId, g]) => ({
-    channelId,
-    min: g.min,
-    max: g.max,
-    roomId: g.roomId || null,
-  }));
-  const hl = [...hlGame.entries()].map(([userId, s]) => ({
-    userId,
-    current: s.current,
-    streak: s.streak,
-    guildId: s.guildId,
-    roomId: s.roomId || null,
-  }));
-  const counting = [...countingGame.entries()].filter(([, c]) => c?.active).map(([channelId, c]) => ({
-    channelId,
-    guildId: c.guildId,
-    next: c.next,
-    start: c.start,
-    reward: c.reward,
-    lastUserId: c.lastUserId,
-    roomId: c.roomId || null,
-  }));
-  return { guess, counting, hl };
-}
-
-// ===== Handlers for discord events =====
-async function onGuessCommand(client, interaction) {
-  await interaction.deferReply({ ephemeral: false });
-  await syncUser(interaction.user);
+async function onGuess(client, interaction) {
+  await interaction.deferReply();
 
   const channelId = interaction.channelId;
   const guildId = interaction.guildId;
 
-  // counting 開著不給 guess
-  const c = countingGame.get(channelId);
-  if (c?.active) return interaction.editReply("此頻道正在進行【數字接龍】，請先 `/counting stop`。");
+  if (countingGame.get(channelId)) {
+    return interaction.editReply("❌ 此頻道正在進行 Counting。");
+  }
 
-  const existing = guessGame.get(channelId);
-  if (existing?.active) return interaction.editReply(`此頻道已經有終極密碼（${existing.min} ~ ${existing.max}）直接猜！`);
+  if (guessGame.get(channelId)) {
+    return interaction.editReply("❌ 已有 Guess 進行中。");
+  }
 
   const min = interaction.options.getInteger("min") ?? 1;
   const max = interaction.options.getInteger("max") ?? 100;
-  const realMin = Math.min(min, max);
-  const realMax = Math.max(min, max);
-  if (realMax - realMin < 3) return interaction.editReply("範圍太小，至少 1~4。");
 
-  const answer = randInt(realMin + 1, realMax - 1);
+  const a = Math.min(min, max);
+  const b = Math.max(min, max);
+
+  const answer = rand(a + 1, b - 1);
 
   const roomId = await setActiveRoom("guess", {
     guildId,
     key: channelId,
     channelId,
     title: "Guess",
-    state: { min: realMin, max: realMax },
-    startedAt: now(),
+    state: { min: a, max: b },
   });
 
-  guessGame.set(channelId, { active: true, answer, min: realMin, max: realMax, roomId });
+  guessGame.set(channelId, {
+    min: a,
+    max: b,
+    answer,
+    roomId,
+  });
 
-  await pushRoomEventRolling(roomId, { kind: "start", min: realMin, max: realMax });
-  await appendRoomEvent("guess", guildId, channelId, { kind: "start", min: realMin, max: realMax });
+  await appendRoomEvent("guess", guildId, channelId, {
+    type: "start",
+    min: a,
+    max: b,
+  });
 
-  return interaction.editReply(
-    `🎯 終極密碼開始！範圍：**${realMin} ~ ${realMax}**（不含邊界）\n直接在此頻道輸入整數猜。\n✅ 猜中 +50 分！`
-  );
+  interaction.editReply(`🎯 Guess 開始！範圍 ${a} ~ ${b}`);
 }
 
-async function onHLCommand(client, interaction) {
-  await interaction.deferReply({ ephemeral: false });
-  await syncUser(interaction.user);
+/* ================= Counting ================= */
+
+async function onCounting(client, interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const sub = interaction.options.getSubcommand();
+  const channelId = interaction.channelId;
+  const guildId = interaction.guildId;
+
+  if (sub === "start") {
+    if (guessGame.get(channelId)) {
+      return interaction.editReply("❌ 有 Guess 進行中。");
+    }
+
+    const start = interaction.options.getInteger("start") ?? 1;
+    const reward = interaction.options.getInteger("reward") ?? 1;
+
+    const roomId = await setActiveRoom("counting", {
+      guildId,
+      key: channelId,
+      channelId,
+      title: "Counting",
+      state: { start, reward },
+    });
+
+    countingGame.set(channelId, {
+      next: start,
+      last: null,
+      reward,
+      roomId,
+      guildId,
+    });
+
+    stopped.delete(channelId);
+
+    await appendRoomEvent("counting", guildId, channelId, {
+      type: "start",
+      start,
+      reward,
+    });
+
+    await interaction.channel.send(`🔢 Counting 開始：${start}`);
+    interaction.editReply("✅ 已啟動");
+  }
+
+  if (sub === "stop") {
+    const cur = countingGame.get(channelId);
+    countingGame.delete(channelId);
+    stopped.set(channelId, now());
+
+    if (cur) {
+      await clearActiveRoom("counting", guildId, channelId);
+      await appendRoomEvent("counting", guildId, channelId, {
+        type: "stop",
+        by: interaction.user.id,
+      });
+    }
+
+    await interaction.channel.send("🛑 Counting 已停止");
+    interaction.editReply("✅ 已停止");
+  }
+
+  if (sub === "status") {
+    const c = countingGame.get(channelId);
+    if (!c) return interaction.editReply("❌ 沒有進行中");
+
+    interaction.editReply(`下一個：${c.next}`);
+  }
+}
+
+/* ================= HL ================= */
+
+function hlButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("hl:up")
+        .setLabel("更大")
+        .setStyle(ButtonStyle.Success),
+
+      new ButtonBuilder()
+        .setCustomId("hl:down")
+        .setLabel("更小")
+        .setStyle(ButtonStyle.Danger),
+
+      new ButtonBuilder()
+        .setCustomId("hl:stop")
+        .setLabel("結束")
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+async function onHL(client, interaction) {
+  await interaction.deferReply();
 
   const userId = interaction.user.id;
   const guildId = interaction.guildId;
-  const current = randInt(1, 13);
+
+  if (hlGame.get(userId)) {
+    return interaction.editReply("❌ 你已經在玩 HL");
+  }
+
+  const cur = rand(1, 13);
 
   const roomId = await setActiveRoom("hl", {
     guildId,
     key: userId,
     userId,
     title: "HL",
-    state: { current, streak: 0 },
-    startedAt: now(),
+    state: { cur },
   });
 
-  hlGame.set(userId, { current, streak: 0, roomId, guildId });
+  hlGame.set(userId, {
+    cur,
+    streak: 0,
+    roomId,
+    guildId,
+  });
 
-  await pushRoomEventRolling(roomId, { kind: "start", current });
-  await appendRoomEvent("hl", guildId, userId, { kind: "start", current });
+  await appendRoomEvent("hl", guildId, userId, {
+    type: "start",
+    cur,
+  });
 
-  return interaction.editReply({
-    content: `🃏 高低牌開始！目前牌：**${current}**（1~13）\n猜對每回合 +5 分（會顯示總分）`,
-    components: makeHLButtons(),
+  interaction.editReply({
+    content: `🃏 目前牌：${cur}`,
+    components: hlButtons(),
   });
 }
 
-async function onCountingCommand(client, interaction) {
-  if (!interaction.inGuild()) return interaction.reply({ content: "此指令只能在伺服器使用。", ephemeral: true });
-  await int
+/* ================= Message Handler ================= */
+
+async function onMessage(client, msg) {
+  if (!msg.guild) return;
+  if (msg.author.bot) return;
+
+  await syncUser(msg.author);
+
+  const channelId = msg.channel.id;
+  const guildId = msg.guild.id;
+  const text = msg.content.trim();
+
+  /* ---- Guess ---- */
+
+  const g = guessGame.get(channelId);
+
+  if (g && isInt(text)) {
+    const n = Number(text);
+
+    if (n === g.answer) {
+      guessGame.delete(channelId);
+      await clearActiveRoom("guess", guildId, channelId);
+
+      let total = null;
+
+      try {
+        total = await addPoints(msg.author.id, 50);
+      } catch {}
+
+      await msg.reply(`🎉 猜中！+50 分（${total ?? "失敗"}）`);
+
+      await appendRoomEvent("guess", guildId, channelId, {
+        type: "win",
+        user: msg.author.id,
+        value: n,
+        total,
+      });
+
+      return;
+    }
+
+    if (n < g.answer) g.min = n;
+    if (n > g.answer) g.max = n;
+
+    msg.reply(`範圍：${g.min} ~ ${g.max}`);
+    return;
+  }
+
+  /* ---- Stop block ---- */
+
+  const st = stopped.get(channelId);
+  if (st && now() - st < STOP_BLOCK_MS) return;
+
+  /* ---- Counting ---- */
+
+  const c = countingGame.get(channelId);
+
+  if (c && isInt(text)) {
+    const n = Number(text);
+
+    if (c.last === msg.author.id) {
+      msg.reply("⛔ 不可連續");
+      return;
+    }
+
+    if (n !== c.next) {
+      c.next = 1;
+      c.last = null;
+
+      msg.reply("❌ 錯誤，重來 1");
+      return;
+    }
+
+    c.last = msg.author.id;
+    c.next++;
+
+    let total = null;
+
+    try {
+      total = await addPoints(msg.author.id, c.reward);
+    } catch {}
+
+    msg.react("✅");
+    msg.reply(`+${c.reward} 分（${total ?? "失敗"}）`);
+
+    await appendRoomEvent("counting", guildId, channelId, {
+      type: "ok",
+      user: msg.author.id,
+      value: n,
+      total,
+    });
+  }
+}
+
+/* ================= Buttons ================= */
+
+async function onButton(client, interaction) {
+  const id = interaction.customId;
+
+  if (!id.startsWith("hl:")) return;
+
+  const userId = interaction.user.id;
+  const s = hlGame.get(userId);
+
+  if (!s) {
+    return interaction.reply({ content: "❌ 無進行中 HL", ephemeral: true });
+  }
+
+  if (id === "hl:stop") {
+    hlGame.delete(userId);
+    await clearActiveRoom("hl", s.guildId, userId);
+
+    return interaction.update({
+      content: `🛑 結束，連勝 ${s.streak}`,
+      components: [],
+    });
+  }
+
+  const next = rand(1, 13);
+
+  const ok =
+    (id === "hl:up" && next > s.cur) ||
+    (id === "hl:down" && next < s.cur);
+
+  if (!ok) {
+    hlGame.delete(userId);
+    await clearActiveRoom("hl", s.guildId, userId);
+
+    return interaction.update({
+      content: `❌ 失敗 ${s.cur} → ${next}`,
+      components: [],
+    });
+  }
+
+  s.cur = next;
+  s.streak++;
+
+  let total = null;
+
+  try {
+    total = await addPoints(userId, 5);
+  } catch {}
+
+  interaction.update({
+    content: `✅ 正確！${next}｜連勝 ${s.streak}（${total ?? "失敗"}）`,
+    components: hlButtons(),
+  });
+}
+
+/* ================= Force Stop ================= */
+
+async function forceStopGuess(guildId, channelId) {
+  guessGame.delete(channelId);
+  await clearActiveRoom("guess", guildId, channelId);
+}
+
+async function forceStopCounting(guildId, channelId) {
+  countingGame.delete(channelId);
+  stopped.set(channelId, now());
+  await clearActiveRoom("counting", guildId, channelId);
+}
+
+async function forceStopHL(guildId, userId) {
+  hlGame.delete(userId);
+  await clearActiveRoom("hl", guildId, userId);
+}
+
+/* ================= Exports ================= */
+
+module.exports = {
+  guessGame,
+  countingGame,
+  hlGame,
+
+  onGuessCommand: onGuess,
+  onCountingCommand: onCounting,
+  onHLCommand: onHL,
+
+  onMessageCreate: onMessage,
+  onButton,
+
+  forceStopGuess,
+  forceStopCounting,
+  forceStopHL,
+
+  syncUser,
+};
