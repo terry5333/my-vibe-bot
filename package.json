@@ -1,7 +1,7 @@
 {
   "name": "my-vibe-bot",
-  "version": "2.0.0",
-  "description": "Discord bot (discord.js v14) + Firebase RTDB + Admin Web (JWT) + Games",
+  "version": "3.0.0",
+  "description": "All-in-one Discord bot + Firebase RTDB + Admin Web (JWT) + Games",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
