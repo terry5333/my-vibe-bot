@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>管理員後台</title>
+  <style>
+    :root{
+      --bg1:#070a12; --bg2:#0b1220;
+      --card: rgba(255,255,255,.08);
+      --stroke: rgba(255,255,255,.14);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.68);
+      --a1:#22d3ee; --a2:#6366f1; --danger:#fb7185;
+      --shadow: 0 18px 60px rgba(0,0,0,.45);
+      --r: 18px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; padding:16px;
+      background:
+        radial-gradient(1000px 700px at 20% 10%, rgba(99,102,241,.22), transparent 55%),
+        radial-gradient(900px 650px at 80% 30%, rgba(34,211,238,.16), transparent 55%),
+        linear-gradient(135deg,var(--bg1),var(--bg2));
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", Arial;
+    }
+    a{color:#a5b4fc;text-decoration:none}
+    .top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+    .title{font-size:18px;font-weight:900}
+    .tabs{display:flex;gap:10px;flex-wrap:wrap}
+    .tab{padding:8px 12px;border-radius:999px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);cursor:pointer}
+    .tab.on{background:linear-gradient(135deg, rgba(34,211,238,.25), rgba(99,102,241,.22));}
+    .layout{display:grid;grid-template-columns: 1fr; gap:12px}
+    @media (min-width: 1100px){ .layout{grid-template-columns: 1fr 1fr 1fr;} }
+    .card{
+      background:var(--card);
+      border:1px solid var(--stroke);
+      border-radius: var(--r);
+      padding: 12px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      min-height: 240px;
+      overflow:hidden;
+    }
+    h3{margin:0 0 10px 0; font-size:13px; color: rgba(255,255,255,.86)}
+    .muted{color:var(--muted); font-size:12px; line-height:1.5}
+    input,button,select{
+      padding:10px 12px;border-radius: 14px;
+      border:1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      outline:none;
+    }
+    button{
+      border:none; cursor:pointer; font-weight:900; color:#081018;
+      background: linear-gradient(135deg,var(--a1),var(--a2));
+    }
+    .btn-danger{background: linear-gradient(135deg, var(--danger), #f43f5e); color:#120a0f;}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    table{width:100%; border-collapse:collapse; overflow:hidden;border-radius: 14px;}
+    th,td{padding:10px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; font-size:13px;}
+    th{background: rgba(255,255,255,.06); font-size:12px; color: rgba(255,255,255,.82)}
+    code{background: rgba(255,255,255,.08); padding:2px 6px; border-radius: 10px;}
+    .avatar{width:34px;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.18);object-fit:cover}
+    .pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);font-size:12px}
+    .hidden{display:none}
+    .split{display:grid;grid-template-columns: 1fr; gap:12px}
+    @media (min-width: 1100px){ .split{grid-template-columns: 1fr 1fr;} }
+    .events{max-height:260px; overflow:auto; border-radius:14px; border:1px solid rgba(255,255,255,.10); padding:8px; background:rgba(0,0,0,.18)}
+    .evt{font-size:12px; color: rgba(255,255,255,.80); padding:6px 6px; border-bottom:1px dashed rgba(255,255,255,.10)}
+    .evt:last-child{border-bottom:none}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="title">管理員後台</div>
+    <div class="tabs">
+      <div class="tab on" data-page="dashboard">控制台</div>
+      <div class="tab" data-page="history">歷史戰績（7天）</div>
+      <div class="tab" data-page="settings">VIP / 結算</div>
+      <a class="tab" href="/admin/logout">登出</a>
+    </div>
+  </div>
+
+  <!-- DASHBOARD: 三區 -->
+  <div id="page-dashboard">
+    <div class="layout">
+      <div class="card">
+        <h3>📊 排行榜（Top 100）</h3>
+        <div class="muted">讀取中…</div>
+        <div id="lb"></div>
+      </div>
+
+      <div class="card">
+        <h3>👤 玩家積分管理</h3>
+        <div class="row" style="margin-bottom:10px;">
+          <input id="uSearch" placeholder="搜尋 userId / 名稱" />
+          <button id="uReload">重新整理</button>
+        </div>
+        <div id="users"></div>
+      </div>
+
+      <div class="card">
+        <h3>🎮 房間管理</h3>
+        <div class="muted">可查看本局紀錄，並強制關閉房間。</div>
+        <div id="rooms"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div id="page-history" class="hidden">
+    <div class="split">
+      <div class="card">
+        <h3>📜 近 7 天房間列表</h3>
+        <div id="days"></div>
+        <div id="roomsByDay" style="margin-top:10px;"></div>
+      </div>
+      <div class="card">
+        <h3>🧾 房間紀錄</h3>
+        <div class="muted">選一個房間後會顯示紀錄</div>
+        <div id="historyEvents" class="events" style="margin-top:10px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div id="page-settings" class="hidden">
+    <div class="split">
+      <div class="card">
+        <h3>👑 VIP 設定</h3>
+        <div class="row" style="margin-bottom:10px;">
+          <span class="pill">即時生效</span>
+        </div>
+        <div class="row">
+          <label class="pill"><input id="vipEnabled" type="checkbox"> 啟用</label>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <input id="vipGuild" placeholder="伺服器ID" />
+          <input id="vipRole" placeholder="身分組ID" />
+          <input id="vipThreshold" placeholder="門檻積分" />
+          <button id="saveVip">保存</button>
+        </div>
+        <div class="muted" style="margin-top:10px;">Bot 需要 Manage Roles，且 Bot 身分組必須高於 VIP 身分組。</div>
+      </div>
+
+      <div class="card">
+        <h3>🎁 每週結算</h3>
+        <div class="row">
+          <label class="pill"><input id="wkEnabled" type="checkbox"> 啟用</label>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <input id="wkTopN" placeholder="Top N" />
+          <input id="wkReward" placeholder="每人獎勵分數" />
+          <button id="saveWk">保存</button>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          <button id="payout">發放本週獎勵</button>
+          <button id="resetLock" class="btn-danger">重置結算鎖</button>
+        </div>
+
+        <div class="events" id="wkLog" style="margin-top:10px;"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function fmtTs(ts){
+    if(!ts) return "";
+    const d = new Date(ts);
+    return d.toLocaleString();
+  }
+
+  async function jget(url){
+    const r = await fetch(url, { credentials: "include" });
+    if(r.status === 401){ location.href="/admin/login"; return null; }
+    return r.json();
+  }
+  async function jpost(url, body){
+    const r = await fetch(url, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      credentials:"include",
+      body: JSON.stringify(body || {})
+    });
+    if(r.status === 401){ location.href="/admin/login"; return null; }
+    return r.json();
+  }
+
+  // tabs
+  document.querySelectorAll(".tab[data-page]").forEach(t => {
+    t.addEventListener("click", () => {
+      document.querySelectorAll(".tab[data-page]").forEach(x=>x.classList.remove("on"));
+      t.classList.add("on");
+
+      const p = t.dataset.page;
+      ["dashboard","history","settings"].forEach(k=>{
+        document.getElementById("page-"+k).classList.toggle("hidden", k !== p);
+      });
+
+      if(p==="history") loadHistory();
+      if(p==="settings") loadSettings();
+    });
+  });
+
+  // Leaderboard
+  async function loadLeaderboard(){
+    const js = await jget("/api/leaderboard?limit=100");
+    if(!js) return;
+    const data = js.data || [];
+    let html = "<table><tr><th>#</th><th>玩家</th><th>積分</th></tr>";
+    data.forEach((x,i)=>{
+      html += \`<tr><td>\${i+1}</td><td><code>\${x.userId}</code></td><td><b>\${x.points}</b></td></tr>\`;
+    });
+    html += "</table>";
+    $("lb").innerHTML = html;
+  }
+
+  // Users (avatar + name + +/-)
+  async function loadUsers(){
+    const q = $("uSearch").value.trim();
+    const js = await jget("/api/users" + (q ? ("?q="+encodeURIComponent(q)) : ""));
+    if(!js) return;
+    const data = js.data || [];
+    let html = "<table><tr><th></th><th>名稱</th><th>UserID</th><th>積分</th><th>調整</th></tr>";
+    data.slice(0,120).forEach(u=>{
+      html += \`
+      <tr>
+        <td>\${u.avatar ? \`<img class="avatar" src="\${u.avatar}" />\` : ""}</td>
+        <td><b>\${(u.name||"")}</b></td>
+        <td><code>\${u.userId}</code></td>
+        <td><b>\${u.points}</b></td>
+        <td>
+          <div class="row">
+            <button onclick="adjust('\${u.userId}', 10)">+10</button>
+            <button onclick="adjust('\${u.userId}', -10)" class="btn-danger">-10</button>
+          </div>
+        </td>
+      </tr>\`;
+    });
+    html += "</table>";
+    $("users").innerHTML = html;
+  }
+
+  async function adjust(userId, amount){
+    const js = await jpost("/api/points/adjust", { userId, amount });
+    if(!js) return;
+    await loadUsers();
+    await loadLeaderboard();
+  }
+
+  $("uReload").addEventListener("click", loadUsers);
+  $("uSearch").addEventListener("keydown", (e)=>{ if(e.key==="Enter") loadUsers(); });
+
+  // Rooms management + show records (from activeDb + live)
+  function renderEvents(events){
+    if(!events || !events.length) return "<div class='muted'>沒有紀錄</div>";
+    return events.map(e => \`<div class="evt">\${fmtTs(e.ts)} — \${JSON.stringify(e)}</div>\`).join("");
+  }
+
+  async function loadRooms(){
+    const js = await jget("/api/rooms");
+    if(!js) return;
+
+    const live = js.live || { guess:[], counting:[], hl:[] };
+
+    let html = "";
+
+    // Guess
+    html += "<div class='pill'>Guess</div>";
+    if(!live.guess.length) html += "<div class='muted' style='margin:8px 0'>目前沒有 Guess</div>";
+    live.guess.forEach(r=>{
+      html += \`
+      <div style="margin:10px 0; padding:10px; border:1px solid rgba(255,255,255,.10); borde
