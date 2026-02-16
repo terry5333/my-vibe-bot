@@ -2,18 +2,20 @@
 
 /**
  * src/bot/commands.js
- * ✅ 不用 setDefaultMemberPermissions（避免版本不支援）
- * ✅ 權限改成執行時檢查：需要 ManageGuild 或 Administrator
+ * ✅ 不用 setDefaultMemberPermissions
+ * ✅ 權限改成執行時檢查：ManageGuild 或 Administrator
+ * ✅ 相容 index.js 先 deferReply：所有回覆改用 editReply / followUp，避免 40060
  */
 
 const {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
+  MessageFlags,
 } = require("discord.js");
 
 const pointsDb = require("../db/points.js");
-const gamesMod = require("./games.js"); // { games, onMessage }
+const gamesMod = require("./games.js");
 
 function isAdmin(interaction) {
   const perms = interaction.memberPermissions;
@@ -24,28 +26,31 @@ function isAdmin(interaction) {
   );
 }
 
-async function reply(interaction, content, ephemeral = true) {
-  // ✅ 防止 40060：永遠只用「一次回覆」
+/**
+ * 統一回覆工具：
+ * - 如果 index.js 已 deferReply：用 editReply（公開）或 followUp（私密）
+ * - 如果尚未回覆：用 reply / reply({flags})
+ */
+async function respond(interaction, payload, { ephemeral = false } = {}) {
+  const flags = ephemeral ? MessageFlags.Ephemeral : undefined;
+
+  // 已 ack（defer / replied）→ 不能再 reply
   if (interaction.deferred || interaction.replied) {
-    return interaction.editReply(
-      typeof content === "string" ? { content } : content
-    );
+    if (ephemeral) {
+      // deferReply(ephemeral:false) 之後不能 edit 成 ephemeral，只能 followUp
+      return interaction.followUp({ ...payload, flags });
+    }
+    return interaction.editReply(payload);
   }
-  if (typeof content === "string") {
-    return interaction.reply({ content, ephemeral });
-  }
-  return interaction.reply(content);
+
+  return interaction.reply({ ...payload, flags });
 }
 
 /* -------------------- 指令宣告（用來註冊）-------------------- */
 const commandData = [
-  new SlashCommandBuilder()
-    .setName("info")
-    .setDescription("顯示機器人資訊與指令列表"),
+  new SlashCommandBuilder().setName("info").setDescription("顯示機器人資訊與指令列表"),
 
-  new SlashCommandBuilder()
-    .setName("points")
-    .setDescription("查看自己的積分"),
+  new SlashCommandBuilder().setName("points").setDescription("查看自己的積分"),
 
   new SlashCommandBuilder()
     .setName("rank")
@@ -114,8 +119,8 @@ const commandData = [
     .addSubcommand((s) => s.setName("status").setDescription("查看終極密碼狀態")),
 ].map((c) => c.toJSON());
 
-/* -------------------- 指令執行（interactionCreate 會呼叫）-------------------- */
-async function execute(interaction, { client } = {}) {
+/* -------------------- 指令執行 -------------------- */
+async function execute(interaction) {
   const { commandName } = interaction;
   const games = gamesMod?.games;
 
@@ -136,140 +141,143 @@ async function execute(interaction, { client } = {}) {
       )
       .setFooter({ text: "提示：counting / guess 都是直接在頻道打數字" });
 
-    return interaction.reply({ embeds: [e] });
+    return respond(interaction, { embeds: [e] });
   }
 
   if (commandName === "points") {
     const p = pointsDb?.getPoints ? await pointsDb.getPoints(interaction.user.id) : 0;
-    return reply(interaction, `💰 <@${interaction.user.id}> 目前積分：**${p}**`, false);
+    return respond(interaction, {
+      content: `💰 <@${interaction.user.id}> 目前積分：**${p}**`,
+    });
   }
 
   if (commandName === "rank") {
     const top = interaction.options.getInteger("top") || 10;
     const rows = pointsDb?.getLeaderboard ? await pointsDb.getLeaderboard(top) : [];
-    if (!rows.length) return reply(interaction, "（目前沒有排行榜資料）", true);
+    if (!rows.length) return respond(interaction, { content: "（目前沒有排行榜資料）" });
 
     const lines = rows.map((r, i) => `**${i + 1}.** <@${r.userId}>：**${r.points}** 分`);
     const e = new EmbedBuilder().setTitle(`🏆 排行榜 Top ${top}`).setDescription(lines.join("\n"));
-    return interaction.reply({ embeds: [e] });
+    return respond(interaction, { embeds: [e] });
   }
 
   if (commandName === "counting") {
-    if (!games?.countingStart) return reply(interaction, "❌ games 模組未載入（counting 無法使用）");
+    if (!games?.countingStart) return respond(interaction, { content: "❌ games 模組未載入（counting 無法使用）" });
 
     const sub = interaction.options.getSubcommand(false);
-    if (!sub) return reply(interaction, "請選擇子指令：/counting start | stop | status", true);
+    if (!sub) return respond(interaction, { content: "❌ 請指定子指令：start/stop/status" }, { ephemeral: true });
 
     const channelId = interaction.channelId;
 
     if (sub === "start") {
       const start = interaction.options.getInteger("start") || 1;
       games.countingStart(channelId, start);
-      return reply(
-        interaction,
-        `✅ counting 已開始！請大家在本頻道依序輸入數字，從 **${start}** 開始。\n規則：同一人連打兩次或打錯就結束。`,
-        false
-      );
+      return respond(interaction, {
+        content:
+          `✅ counting 已開始！請大家在本頻道依序輸入數字，從 **${start}** 開始。\n` +
+          "規則：同一人連打兩次或打錯就結束。",
+      });
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return reply(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return respond(interaction, { content: "❌ 需要管理員權限（Manage Server）才能 stop。" }, { ephemeral: true });
       games.countingStop(channelId);
-      return reply(interaction, "🛑 counting 已結束。", false);
+      return respond(interaction, { content: "🛑 counting 已結束。" });
     }
 
     if (sub === "status") {
       const s = games.countingStatus(channelId);
-      if (!s?.active) return reply(interaction, "ℹ️ 本頻道沒有進行中的 counting。", true);
-      return reply(interaction, `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`, true);
+      if (!s?.active) return respond(interaction, { content: "ℹ️ 本頻道沒有進行中的 counting。" }, { ephemeral: true });
+      return respond(interaction, { content: `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**` }, { ephemeral: true });
     }
   }
 
   if (commandName === "hl") {
-    if (!games?.hlStart) return reply(interaction, "❌ games 模組未載入（hl 無法使用）");
+    if (!games?.hlStart) return respond(interaction, { content: "❌ games 模組未載入（hl 無法使用）" });
 
     const sub = interaction.options.getSubcommand(false);
-    if (!sub) return reply(interaction, "請選擇子指令：/hl start | stop | status", true);
+    if (!sub) return respond(interaction, { content: "❌ 請指定子指令：start/stop/status" }, { ephemeral: true });
 
     const channelId = interaction.channelId;
 
     if (sub === "start") {
       const max = interaction.options.getInteger("max") || 100;
       const msg = await games.hlStart(interaction, channelId, max);
-      return reply(interaction, msg, true);
+      // hlStart 可能會自己送訊息，這裡只回一句
+      return respond(interaction, { content: msg || "✅ HL 已開始。" }, { ephemeral: true });
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return reply(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return respond(interaction, { content: "❌ 需要管理員權限（Manage Server）才能 stop。" }, { ephemeral: true });
       games.hlStop(channelId);
-      return reply(interaction, "🛑 HL 已結束。", false);
+      return respond(interaction, { content: "🛑 HL 已結束。" });
     }
 
     if (sub === "status") {
       const s = games.hlStatus(channelId);
-      if (!s?.active) return reply(interaction, "ℹ️ 本頻道沒有進行中的 HL。", true);
-      return reply(interaction, `ℹ️ HL 進行中（1 ~ ${s.max}）`, true);
+      if (!s?.active) return respond(interaction, { content: "ℹ️ 本頻道沒有進行中的 HL。" }, { ephemeral: true });
+      return respond(interaction, { content: `ℹ️ HL 進行中（1 ~ ${s.max}）` }, { ephemeral: true });
     }
   }
 
   if (commandName === "guess") {
-    if (!games?.guessStart) return reply(interaction, "❌ games 模組未載入（guess 無法使用）");
+    if (!games?.guessStart) return respond(interaction, { content: "❌ games 模組未載入（guess 無法使用）" });
 
     const sub = interaction.options.getSubcommand(false);
-    if (!sub) return reply(interaction, "請選擇子指令：/guess set | start | stop | status", true);
+    if (!sub) return respond(interaction, { content: "❌ 請指定子指令：set/start/stop/status" }, { ephemeral: true });
 
     const channelId = interaction.channelId;
 
     if (sub === "set") {
-      if (!isAdmin(interaction)) return reply(interaction, "❌ 只有管理員可以 /guess set。");
+      if (!isAdmin(interaction)) return respond(interaction, { content: "❌ 只有管理員可以 /guess set。" }, { ephemeral: true });
       const secret = interaction.options.getInteger("secret");
       const min = interaction.options.getInteger("min") ?? 1;
       const max = interaction.options.getInteger("max") ?? 100;
 
       games.guessSet(channelId, { min, max, secret });
-      return reply(
-        interaction,
-        `✅ 終極密碼已設定！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`,
-        false
-      );
+      return respond(interaction, {
+        content:
+          `✅ 終極密碼已設定！範圍 **${min} ~ ${max}**。\n` +
+          "請大家直接在本頻道輸入數字猜（猜中 +10 分）。",
+      });
     }
 
     if (sub === "start") {
       const min = interaction.options.getInteger("min") ?? 1;
       const max = interaction.options.getInteger("max") ?? 100;
       games.guessStart(channelId, { min, max });
-      return reply(
-        interaction,
-        `✅ 終極密碼開始！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`,
-        false
-      );
+      return respond(interaction, {
+        content:
+          `✅ 終極密碼開始！範圍 **${min} ~ ${max}**。\n` +
+          "請大家直接在本頻道輸入數字猜（猜中 +10 分）。",
+      });
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return reply(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return respond(interaction, { content: "❌ 需要管理員權限（Manage Server）才能 stop。" }, { ephemeral: true });
       games.guessStop(channelId);
-      return reply(interaction, "🛑 終極密碼已結束。", false);
+      return respond(interaction, { content: "🛑 終極密碼已結束。" });
     }
 
     if (sub === "status") {
       const s = games.guessStatus(channelId);
-      if (!s?.active) return reply(interaction, "ℹ️ 本頻道沒有進行中的終極密碼。", true);
-      return reply(interaction, `ℹ️ 終極密碼範圍：**${s.min} ~ ${s.max}**`, true);
+      if (!s?.active) return respond(interaction, { content: "ℹ️ 本頻道沒有進行中的終極密碼。" }, { ephemeral: true });
+      return respond(interaction, { content: `ℹ️ 終極密碼範圍：**${s.min} ~ ${s.max}**` }, { ephemeral: true });
     }
   }
 
-  return reply(interaction, `❌ 未處理的指令：/${commandName}`, true);
+  return respond(interaction, { content: `❌ 未處理的指令：/${commandName}` }, { ephemeral: true });
 }
 
-/* ✅ 給 index.js 使用 */
-function makeCommandHandlers(ctx = {}) {
+/* -------------------- 給 index.js 使用：commandName -> handler -------------------- */
+function makeCommandHandlers() {
   return {
-    info: (i) => execute(i, ctx),
-    points: (i) => execute(i, ctx),
-    rank: (i) => execute(i, ctx),
-    counting: (i) => execute(i, ctx),
-    hl: (i) => execute(i, ctx),
-    guess: (i) => execute(i, ctx),
+    info: (i) => execute(i),
+    points: (i) => execute(i),
+    rank: (i) => execute(i),
+    counting: (i) => execute(i),
+    hl: (i) => execute(i),
+    guess: (i) => execute(i),
   };
 }
 
