@@ -2,13 +2,18 @@
 
 /**
  * src/bot/games.js
- * 需要在你的 bot/events.js 裡面接：
  *
- * const games = require("./games");
- * client.on("interactionCreate", (i) => games.handleInteraction(client, i));
- * client.on("messageCreate", (m) => games.handleMessage(client, m));
+ * ✅ 這份是「完整可用版」：
+ * - /guess 終極密碼（文字輸入）
+ * - /counting 數字接龍（文字輸入）
+ * - /hl 高低牌（按鈕）
+ * - /stop 停止本頻道遊戲（房主/管理員）
+ * - 提供 Web 後台用：
+ *    - getRoomsSnapshot()
+ *    - getHistory7d()
+ *    - forceStopByChannelId()  // 給後台強制停用
  *
- * ⚠️ 你的 client intents 必須包含 GatewayIntentBits.MessageContent
+ * ⚠️ 你的 client intents 必須包含 GatewayIntentBits.MessageContent（counting/guess 需要讀訊息內容）
  */
 
 const {
@@ -19,8 +24,7 @@ const {
   PermissionsBitField,
 } = require("discord.js");
 
-const { addPoints, getPoints, getTopPoints } = require("../db/points"); // 你 points.js 要有這些
-// 如果你 points.js 目前只有 addPoints，你也可以先把 getPoints/getTopPoints 做成 stub
+const { addPoints, getPoints, getTopPoints } = require("../db/points"); // points.js 需要有這些（至少 addPoints）
 
 /* ==============================
    In-memory Game Rooms & History
@@ -127,10 +131,9 @@ function mustInGuild(interaction) {
    Points wrapper (always await)
 ================================ */
 
-async function award(interactionOrMsg, userId, amount, reason) {
+async function award(_interactionOrMsg, userId, amount, reason) {
   // addPoints 必須是 async，並且真的寫入成功才回傳
-  const res = await addPoints(userId, amount, reason || "game");
-  return res;
+  return await addPoints(userId, amount, reason || "game");
 }
 
 /* ==============================
@@ -176,8 +179,8 @@ async function startGuess(interaction) {
   return safeEdit(interaction, {
     content:
       "🎯 **終極密碼開始！**\n" +
-      `請在這個頻道輸入 1~100 的數字來猜。\n` +
-      `猜中者獲得 **+50 分**！`,
+      "請在這個頻道輸入 1~100 的數字來猜。\n" +
+      "猜中者獲得 **+50 分**！",
   });
 }
 
@@ -196,8 +199,7 @@ async function handleGuessMessage(msg, room) {
 
     try {
       await award(msg, msg.author.id, 50, "guess_win");
-    } catch (e) {
-      // 加分失敗也要告知
+    } catch {
       await msg.channel.send("⚠️ 加分時發生錯誤，請稍後再試。");
     }
 
@@ -262,18 +264,8 @@ async function startCounting(interaction) {
   });
 }
 
-async function stopCountingRoom(interaction, room) {
-  room.active = false;
-  room.log.push({ ts: now(), type: "stop", by: interaction.user.id });
-  pushHistoryIfEnded(room, { stoppedBy: interaction.user.id });
-  deleteRoom(room.guildId, room.channelId);
-
-  // ✅ 這行就是你之前炸掉的地方：保證完整一行
-  return interaction.editReply("✅ 已停止：counting");
-}
-
 async function handleCountingMessage(msg, room) {
-  // 房間已關就不管（防止你說的「停止後還回」）
+  // 房間已關就不管（防止停止後還回）
   if (!room.active) return;
 
   // 只吃純數字
@@ -301,10 +293,10 @@ async function handleCountingMessage(msg, room) {
 
   room.log.push({ ts: now(), type: "ok", userId: msg.author.id, n, next: room.meta.next });
 
-  // ✅ 你要的「表情符號」：每次正確就給 ✅
+  // 每次正確就給 ✅
   await msg.react("✅").catch(() => {});
 
-  // ✅ 設計：每 5 次連續正確，最後那個人 +3 分（避免每次都狂寫 DB）
+  // 每 5 次連續正確，最後那個人 +3 分
   if (room.meta.streak % 5 === 0) {
     try {
       await award(msg, msg.author.id, 3, "counting_milestone");
@@ -400,8 +392,8 @@ async function startHL(interaction) {
     )
     .setFooter({ text: "按下「更高 / 更低」開始" });
 
-  const msg = await safeEdit(interaction, { embeds: [embed], components: hlComponents(false) });
-  // interaction.editReply 回傳 Message 可能拿不到，保險用 fetch
+  await safeEdit(interaction, { embeds: [embed], components: hlComponents(false) });
+
   try {
     const sent = await interaction.fetchReply();
     room.meta.messageId = sent.id;
@@ -428,7 +420,7 @@ async function handleHLButton(interaction, room, pick) {
     return interaction.reply({ content: "⚠️ 這局已結束。", ephemeral: true }).catch(() => {});
   }
 
-  // 只允許開局者玩（避免別人亂按）
+  // 只允許開局者玩
   if (interaction.user.id !== room.meta.playerId) {
     return interaction.reply({ content: "❌ 只有開局者可以操作。", ephemeral: true }).catch(() => {});
   }
@@ -461,11 +453,10 @@ async function handleHLButton(interaction, room, pick) {
     room.meta.current = next;
     room.meta.wins += 1;
 
-    // ✅ 猜對立刻加分 + 更新訊息（你說的「猜對沒反應」就是要 update）
+    // 猜對立刻加分 + 更新訊息
     try {
       await award(interaction, interaction.user.id, 5, "hl_win");
     } catch {
-      // 不影響 UI 更新，但要提示
       await interaction.followUp({ content: "⚠️ 加分失敗，請稍後再試。", ephemeral: true }).catch(() => {});
     }
 
@@ -528,7 +519,6 @@ async function stopAny(interaction) {
   pushHistoryIfEnded(room, { stoppedBy: interaction.user.id });
   deleteRoom(interaction.guildId, interaction.channelId);
 
-  // ✅ 這裡也用「不會貼壞」的一行
   return safeEdit(interaction, { content: `✅ 已停止：${room.type}` });
 }
 
@@ -536,7 +526,7 @@ async function stopAny(interaction) {
    Leaderboard / Rank helpers
 ================================ */
 
-async function renderTop10Embed(guild, top) {
+async function renderTop10Embed(_guild, top) {
   const embed = new EmbedBuilder().setTitle("🏆 排行榜 Top 10").setDescription("（依積分排序）");
 
   if (!top || top.length === 0) {
@@ -579,15 +569,30 @@ function getRoomsSnapshot() {
 }
 
 function getHistory7d() {
-  // 回傳副本
   return history7d.slice(-200);
+}
+
+/**
+ * ✅ 給 Web 後台/系統用：用 guildId + channelId 直接強制停止
+ * - game 先保留（你之後要做「只停 hl」之類才用得到）
+ */
+function forceStopByChannelId(guildId, channelId, game = "all") {
+  const room = getRoom(guildId, channelId);
+  if (!room || !room.active) return false;
+
+  room.active = false;
+  room.log.push({ ts: now(), type: "force_stop", by: "admin", game });
+
+  pushHistoryIfEnded(room, { stoppedBy: "admin", forced: true });
+  deleteRoom(guildId, channelId);
+  return true;
 }
 
 /* ==============================
    Main handlers
 ================================ */
 
-async function handleInteraction(client, interaction) {
+async function handleInteraction(_client, interaction) {
   try {
     // Slash Commands
     if (interaction.isChatInputCommand()) {
@@ -602,10 +607,16 @@ async function handleInteraction(client, interaction) {
         if (!mustInGuild(interaction)) return;
         await safeDefer(interaction, false);
 
-        // getTopPoints 你要做成走快取（你之前要求 /rank 秒回）
         const top = await getTopPoints(10);
         const embed = await renderTop10Embed(interaction.guild, top);
         return safeEdit(interaction, { embeds: [embed] });
+      }
+
+      // （可選）points：顯示自己的點數
+      if (name === "points") {
+        await safeDefer(interaction, true);
+        const p = await getPoints(interaction.user.id);
+        return safeEdit(interaction, { content: `⭐ 你的目前積分：**${p}**` });
       }
 
       return;
@@ -616,18 +627,25 @@ async function handleInteraction(client, interaction) {
       const room = getRoom(interaction.guildId, interaction.channelId);
 
       // HL buttons
-      if (interaction.customId === "hl_high" || interaction.customId === "hl_low" || interaction.customId === "hl_stop") {
+      if (
+        interaction.customId === "hl_high" ||
+        interaction.customId === "hl_low" ||
+        interaction.customId === "hl_stop"
+      ) {
         if (!room || room.type !== "hl") {
-          return interaction.reply({ content: "⚠️ 本頻道沒有進行中的 HL。", ephemeral: true }).catch(() => {});
+          return interaction
+            .reply({ content: "⚠️ 本頻道沒有進行中的 HL。", ephemeral: true })
+            .catch(() => {});
         }
 
         if (interaction.customId === "hl_stop") {
-          // 房主/管理員可停
           const member = interaction.member;
           const isOwner = room.ownerId === interaction.user.id;
           const isAdmin = isAdminMember(member);
           if (!isOwner && !isAdmin) {
-            return interaction.reply({ content: "❌ 只有開局者或管理員可以停止。", ephemeral: true }).catch(() => {});
+            return interaction
+              .reply({ content: "❌ 只有開局者或管理員可以停止。", ephemeral: true })
+              .catch(() => {});
           }
           return stopHLRoom(interaction, room, "manual_stop");
         }
@@ -650,7 +668,7 @@ async function handleInteraction(client, interaction) {
   }
 }
 
-async function handleMessage(client, msg) {
+async function handleMessage(_client, msg) {
   try {
     if (!msg.guild || !msg.channel) return;
     if (msg.author?.bot) return;
@@ -658,7 +676,7 @@ async function handleMessage(client, msg) {
     const room = getRoom(msg.guild.id, msg.channel.id);
     if (!room || !room.active) return;
 
-    // ✅ 重要：counting / guess 不互相干擾
+    // counting / guess 不互相干擾
     if (room.type === "guess") return handleGuessMessage(msg, room);
     if (room.type === "counting") return handleCountingMessage(msg, room);
 
@@ -671,30 +689,15 @@ async function handleMessage(client, msg) {
 
 /* ==============================
    Slash Commands definition (optional)
-   你可以在 registerCommands.js 用這個輸出
 ================================ */
 
 const commands = [
-  {
-    name: "guess",
-    description: "開始終極密碼（在本頻道）",
-  },
-  {
-    name: "counting",
-    description: "開始 Counting（在本頻道）",
-  },
-  {
-    name: "hl",
-    description: "開始高低牌（按鈕遊戲）",
-  },
-  {
-    name: "stop",
-    description: "停止本頻道進行中的遊戲",
-  },
-  {
-    name: "rank",
-    description: "查看排行榜",
-  },
+  { name: "guess", description: "開始終極密碼（在本頻道）" },
+  { name: "counting", description: "開始 Counting（在本頻道）" },
+  { name: "hl", description: "開始高低牌（按鈕遊戲）" },
+  { name: "stop", description: "停止本頻道進行中的遊戲" },
+  { name: "rank", description: "查看排行榜" },
+  { name: "points", description: "查看我的積分" },
 ];
 
 module.exports = {
@@ -704,6 +707,7 @@ module.exports = {
   // 給你的 web 後台用
   getRoomsSnapshot,
   getHistory7d,
+  forceStopByChannelId,
 
   // 給註冊指令用（可選）
   commands,
