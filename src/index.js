@@ -2,9 +2,10 @@
 
 /**
  * src/index.js
- * - 統一處理 interaction：先 ephemeral defer，執行後 deleteReply()，避免聊天室多一段回覆
- * - 只留一個 interactionCreate handler，避免 40060
- * - counting/guess 用 messageCreate
+ * - ✅ 只留一個 interactionCreate handler（避免 40060 重複回覆）
+ * - ✅ ChatInputCommand：先 ephemeral defer，指令用 channel.send() 發在頻道，最後 deleteReply()
+ * - ✅ Button（HL）：交給 gamesMod.onInteraction 處理（不做 deferReply）
+ * - ✅ messageCreate：counting/guess 讀頻道數字
  */
 
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
@@ -19,10 +20,7 @@ function safeInitFirebase() {
     const fb = require("./db/firebase");
     if (typeof fb === "function") return fb();
     if (fb && typeof fb.initFirebase === "function") return fb.initFirebase();
-    // 其他情況：忽略
-  } catch (_) {
-    // 沒有 firebase 模組就忽略
-  }
+  } catch (_) {}
 }
 
 // ---- env ----
@@ -48,7 +46,6 @@ safeInitFirebase();
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
-  // 註冊指令：只註冊 GUILD，並清掉 GLOBAL，避免指令重複
   try {
     await registerCommands(client);
     console.log("[Commands] registered");
@@ -57,30 +54,32 @@ client.once("ready", async () => {
   }
 });
 
-// ✅ 唯一 interactionCreate handler（避免重複回覆）
+// ✅ 唯一 interactionCreate handler
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  // 先 defer（ephemeral），避免 3 秒超時 Unknown interaction 10062
-  // 用 flags 避免 ephemeral deprecated 警告
   try {
+    // 1) 先處理「按鈕」（HL）
+    if (interaction.isButton()) {
+      if (typeof gamesMod?.onInteraction === "function") {
+        await gamesMod.onInteraction(interaction, { client });
+      }
+      return; // 按鈕就到此結束
+    }
+
+    // 2) 只處理 Slash 指令
+    if (!interaction.isChatInputCommand()) return;
+
+    // 先 defer（ephemeral）避免超時 Unknown interaction 10062
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
-  } catch (e) {
-    // defer 失敗就不要硬回覆，讓下面走 try/catch
-  }
 
-  try {
-    // 執行指令（commands 內不要再 interaction.reply）
+    // 執行指令（commands.js 內會用 channel.send() 真正發到頻道）
     const result = await commands.execute(interaction, { client });
 
-    // 預設：把 ephemeral 回覆刪掉 → 使用者不會看到「已公開/已回覆」之類多餘訊息
-    // 若你未來想保留某些指令的私密回覆，可讓 commands.execute 回傳 { keepReply: true }
+    // 預設刪掉 ephemeral 回覆，避免使用者看到多餘「已回覆/已公開」提示
     const keepReply = Boolean(result && result.keepReply);
     if (!keepReply) {
       try {
-        // 只有 defer/replied 才能 delete
         if (interaction.deferred || interaction.replied) {
           await interaction.deleteReply();
         }
@@ -89,13 +88,12 @@ client.on("interactionCreate", async (interaction) => {
   } catch (err) {
     console.error("[interactionCreate] error:", err);
 
-    // 出錯也不要在頻道噴一堆訊息：只用 ephemeral 提示（或直接刪掉）
+    // 出錯時：短暫 ephemeral 提示後刪掉
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
-        // 2 秒後刪掉，避免留下訊息
         setTimeout(() => interaction.deleteReply().catch(() => {}), 2000);
-      } else {
+      } else if (interaction.isRepliable?.()) {
         await interaction.reply({
           content: "❌ 指令執行出錯，請稍後再試。",
           flags: MessageFlags.Ephemeral,
