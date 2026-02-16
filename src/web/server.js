@@ -241,14 +241,25 @@ app.post("/admin/api/settings", apiAuth, async (req, res) => {
 /* ================= 404 ================= */
 app.use((req, res) => res.status(404).send("Not Found"));
 
-/* ================= Start ================= */
+/* ================= Runtime / Start ================= */
+let runtime = { app, client: null };
+
 function startWeb() {
   const PORT = Number(process.env.PORT || 3000);
   app.listen(PORT, () => console.log(`[Web] listening on ${PORT}`));
-  return { app };
+  return runtime;
 }
 
-module.exports = { startWeb, app };
+/**
+ * ✅ 給 index.js 用：把 discord client 掛進 runtime
+ */
+function attachRuntime(webRuntime, { client }) {
+  const rt = webRuntime || runtime;
+  rt.client = client;
+  return rt;
+}
+
+module.exports = { startWeb, attachRuntime, app };
 
 /* -------------------- HTML -------------------- */
 function loginHtml(showErr) {
