@@ -3,712 +3,360 @@
 /**
  * src/bot/games.js
  *
- * ✅ 這份是「完整可用版」：
- * - /guess 終極密碼（文字輸入）
- * - /counting 數字接龍（文字輸入）
- * - /hl 高低牌（按鈕）
- * - /stop 停止本頻道遊戲（房主/管理員）
- * - 提供 Web 後台用：
- *    - getRoomsSnapshot()
- *    - getHistory7d()
- *    - forceStopByChannelId()  // 給後台強制停用
+ * 文字觸發遊戲：
+ *  - 終極密碼：!up start / !up end / !up reset / !up status / !up <number>
+ *  - 數字接龍：!count start / !count end / !count reset / !count status / 直接輸入數字就算
  *
- * ⚠️ 你的 client intents 必須包含 GatewayIntentBits.MessageContent（counting/guess 需要讀訊息內容）
+ * 每個「頻道」各自一局（不會互相干擾）
  */
 
-const {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  PermissionsBitField,
-} = require("discord.js");
+const PREFIX_UP = "!up";
+const PREFIX_COUNT = "!count";
 
-const { addPoints, getPoints, getTopPoints } = require("../db/points"); // points.js 需要有這些（至少 addPoints）
+// -------------------- In-memory states (per channel) --------------------
+/** @type {Map<string, {active:boolean, low:number, high:number, answer:number, tries:number, startedBy:string, startedAt:number}>} */
+const upState = new Map();
 
-/* ==============================
-   In-memory Game Rooms & History
-================================ */
+/** @type {Map<string, {active:boolean, next:number, lastUserId:string|null, startedBy:string, startedAt:number, streak:number}>} */
+const countState = new Map();
 
-const rooms = new Map(); // key: `${guildId}:${channelId}` -> room object
-const history7d = []; // { ts, guildId, channelId, type, events: [...], winnerId? }
-
-/**
- * room structure:
- * {
- *   guildId, channelId, type: 'counting'|'guess'|'hl',
- *   active: true,
- *   createdAt,
- *   ownerId,
- *   meta: {...},
- *   log: [{ts, type, ...}]
- * }
- */
-
-function roomKey(guildId, channelId) {
-  return `${guildId}:${channelId}`;
-}
-
+// -------------------- Helpers --------------------
 function now() {
   return Date.now();
 }
 
-function pushHistoryIfEnded(room, extra = {}) {
-  // 清掉超過 7 天
-  const cutoff = now() - 7 * 24 * 60 * 60 * 1000;
-  while (history7d.length && history7d[0].ts < cutoff) history7d.shift();
-
-  history7d.push({
-    ts: now(),
-    guildId: room.guildId,
-    channelId: room.channelId,
-    type: room.type,
-    events: room.log.slice(-300), // 保留最後 300 筆避免爆
-    ...extra,
-  });
+function chanId(message) {
+  return message?.channel?.id || "unknown";
 }
 
-function getRoom(guildId, channelId) {
-  return rooms.get(roomKey(guildId, channelId)) || null;
-}
-
-function setRoom(room) {
-  rooms.set(roomKey(room.guildId, room.channelId), room);
-}
-
-function deleteRoom(guildId, channelId) {
-  rooms.delete(roomKey(guildId, channelId));
-}
-
-/* ==============================
-   Safe interaction helpers
-================================ */
-
-async function safeDefer(interaction, ephemeral = false) {
+function isAdminLike(member) {
+  // 管理員/伺服器管理權限
   try {
-    if (interaction.deferred || interaction.replied) return;
-    await interaction.deferReply({ ephemeral });
-  } catch {}
-}
-
-async function safeEdit(interaction, payload) {
-  try {
-    if (interaction.deferred || interaction.replied) {
-      return await interaction.editReply(payload);
-    }
-    return await interaction.reply(payload);
-  } catch {}
-}
-
-async function safeFollow(interaction, payload) {
-  try {
-    return await interaction.followUp(payload);
-  } catch {}
-}
-
-/* ==============================
-   Utility: Permissions checks
-================================ */
-
-function isAdminMember(member) {
-  try {
-    if (!member) return false;
-    return member.permissions.has(PermissionsBitField.Flags.Administrator);
+    return Boolean(member?.permissions?.has?.("Administrator") || member?.permissions?.has?.("ManageGuild"));
   } catch {
     return false;
   }
 }
 
-function mustInGuild(interaction) {
-  if (!interaction.guildId) {
-    safeEdit(interaction, { content: "❌ 這個指令只能在伺服器內使用。" });
-    return false;
-  }
-  return true;
+function parseIntSafe(s) {
+  const n = Number(String(s).trim());
+  if (!Number.isFinite(n)) return null;
+  if (!Number.isInteger(n)) return null;
+  return n;
 }
 
-/* ==============================
-   Points wrapper (always await)
-================================ */
-
-async function award(_interactionOrMsg, userId, amount, reason) {
-  // addPoints 必須是 async，並且真的寫入成功才回傳
-  return await addPoints(userId, amount, reason || "game");
+function clampRange(low, high) {
+  // 避免太誇張的範圍（防刷/防亂）
+  const MIN = -1000000;
+  const MAX = 1000000;
+  const l = Math.max(MIN, Math.min(MAX, low));
+  const h = Math.max(MIN, Math.min(MAX, high));
+  return [Math.min(l, h), Math.max(l, h)];
 }
 
-/* ==============================
-   Game: Guess (終極密碼)
-================================ */
-
-function createGuessRoom(guildId, channelId, ownerId) {
-  const target = Math.floor(Math.random() * 100) + 1; // 1~100
-  const room = {
-    guildId,
-    channelId,
-    ownerId,
-    type: "guess",
-    active: true,
-    createdAt: now(),
-    meta: {
-      min: 1,
-      max: 100,
-      target,
-      attempts: 0,
-    },
-    log: [],
-  };
-  room.log.push({ ts: now(), type: "start", targetHidden: true });
-  return room;
+function pickAnswer(low, high) {
+  // inclusive
+  const r = Math.floor(Math.random() * (high - low + 1)) + low;
+  return r;
 }
 
-async function startGuess(interaction) {
-  if (!mustInGuild(interaction)) return;
-  await safeDefer(interaction, false);
-
-  const key = roomKey(interaction.guildId, interaction.channelId);
-  const existing = rooms.get(key);
-  if (existing && existing.active) {
-    return safeEdit(interaction, {
-      content: `⚠️ 本頻道已有進行中的遊戲：**${existing.type}**（請先 /stop 停止）`,
-    });
-  }
-
-  const room = createGuessRoom(interaction.guildId, interaction.channelId, interaction.user.id);
-  rooms.set(key, room);
-
-  return safeEdit(interaction, {
-    content:
-      "🎯 **終極密碼開始！**\n" +
-      "請在這個頻道輸入 1~100 的數字來猜。\n" +
-      "猜中者獲得 **+50 分**！",
-  });
+function mention(userId) {
+  return `<@${userId}>`;
 }
 
-async function handleGuessMessage(msg, room) {
-  // 只處理文字數字
-  const n = Number(msg.content);
-  if (!Number.isInteger(n)) return;
-  if (n < room.meta.min || n > room.meta.max) return;
-
-  room.meta.attempts += 1;
-  room.log.push({ ts: now(), type: "guess", userId: msg.author.id, n });
-
-  if (n === room.meta.target) {
-    // 猜中：回覆 + 加分 + 關房
-    await msg.reply(`🎉 ${msg.author} 猜中了！答案是 **${n}**，獲得 **+50 分**！`);
-
+async function safeReply(message, content) {
+  try {
+    return await message.reply({ content, allowedMentions: { repliedUser: false } });
+  } catch {
     try {
-      await award(msg, msg.author.id, 50, "guess_win");
+      return await message.channel.send({ content });
     } catch {
-      await msg.channel.send("⚠️ 加分時發生錯誤，請稍後再試。");
-    }
-
-    room.log.push({ ts: now(), type: "win", userId: msg.author.id, n });
-    room.active = false;
-
-    pushHistoryIfEnded(room, { winnerId: msg.author.id });
-    deleteRoom(room.guildId, room.channelId);
-    return;
-  }
-
-  // 沒猜中：縮範圍並提示
-  if (n < room.meta.target) {
-    room.meta.min = Math.max(room.meta.min, n + 1);
-  } else {
-    room.meta.max = Math.min(room.meta.max, n - 1);
-  }
-
-  await msg.reply(`❌ 不對！範圍縮小：**${room.meta.min} ~ ${room.meta.max}**`);
-}
-
-/* ==============================
-   Game: Counting
-================================ */
-
-function createCountingRoom(guildId, channelId, ownerId) {
-  const room = {
-    guildId,
-    channelId,
-    ownerId,
-    type: "counting",
-    active: true,
-    createdAt: now(),
-    meta: {
-      next: 1,
-      lastUserId: null,
-      streak: 0,
-    },
-    log: [],
-  };
-  room.log.push({ ts: now(), type: "start", next: 1 });
-  return room;
-}
-
-async function startCounting(interaction) {
-  if (!mustInGuild(interaction)) return;
-  await safeDefer(interaction, false);
-
-  const key = roomKey(interaction.guildId, interaction.channelId);
-  const existing = rooms.get(key);
-  if (existing && existing.active) {
-    return safeEdit(interaction, {
-      content: `⚠️ 本頻道已有進行中的遊戲：**${existing.type}**（請先 /stop 停止）`,
-    });
-  }
-
-  const room = createCountingRoom(interaction.guildId, interaction.channelId, interaction.user.id);
-  rooms.set(key, room);
-
-  return safeEdit(interaction, {
-    content: "🔢 **Counting 開始！**\n請依序輸入數字：從 **1** 開始。\n規則：不能連續兩次同一人。",
-  });
-}
-
-async function handleCountingMessage(msg, room) {
-  // 房間已關就不管（防止停止後還回）
-  if (!room.active) return;
-
-  // 只吃純數字
-  const n = Number(msg.content);
-  if (!Number.isInteger(n)) return;
-
-  // 不能連續同人
-  if (room.meta.lastUserId && room.meta.lastUserId === msg.author.id) {
-    room.log.push({ ts: now(), type: "invalid", reason: "same_user", userId: msg.author.id, n });
-    await msg.reply(`❌ 不行喔！不能連續兩次同一個人。下一個應該是 **${room.meta.next}**`);
-    return;
-  }
-
-  // 不是正確下一個數字
-  if (n !== room.meta.next) {
-    room.log.push({ ts: now(), type: "invalid", reason: "wrong_number", userId: msg.author.id, n });
-    await msg.reply(`❌ 數字錯了！下一個應該是 **${room.meta.next}**`);
-    return;
-  }
-
-  // 正確
-  room.meta.lastUserId = msg.author.id;
-  room.meta.next += 1;
-  room.meta.streak += 1;
-
-  room.log.push({ ts: now(), type: "ok", userId: msg.author.id, n, next: room.meta.next });
-
-  // 每次正確就給 ✅
-  await msg.react("✅").catch(() => {});
-
-  // 每 5 次連續正確，最後那個人 +3 分
-  if (room.meta.streak % 5 === 0) {
-    try {
-      await award(msg, msg.author.id, 3, "counting_milestone");
-      await msg.reply(`🎁 恭喜達成連續 **${room.meta.streak}** 次！${msg.author} 獲得 **+3 分**`);
-    } catch {
-      await msg.channel.send("⚠️ 加分時發生錯誤，請稍後再試。");
+      return null;
     }
   }
 }
 
-/* ==============================
-   Game: HL (高低牌)
-================================ */
-
-function drawCard() {
-  // 1~13
-  return Math.floor(Math.random() * 13) + 1;
-}
-
-function cardText(v) {
-  if (v === 1) return "A";
-  if (v === 11) return "J";
-  if (v === 12) return "Q";
-  if (v === 13) return "K";
-  return String(v);
-}
-
-function createHLRoom(guildId, channelId, ownerId) {
-  const current = drawCard();
-  const room = {
-    guildId,
-    channelId,
-    ownerId,
-    type: "hl",
-    active: true,
-    createdAt: now(),
-    meta: {
-      playerId: ownerId,
-      current,
-      rounds: 0,
-      wins: 0,
-      messageId: null,
-    },
-    log: [],
-  };
-  room.log.push({ ts: now(), type: "start", current });
-  return room;
-}
-
-function hlComponents(disabled = false) {
+function helpText() {
   return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("hl_high")
-        .setLabel("更高")
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(disabled),
-      new ButtonBuilder()
-        .setCustomId("hl_low")
-        .setLabel("更低")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(disabled),
-      new ButtonBuilder()
-        .setCustomId("hl_stop")
-        .setLabel("停止")
-        .setStyle(ButtonStyle.Danger)
-        .setDisabled(disabled)
-    ),
-  ];
+    "🎮 **遊戲指令**",
+    "",
+    "**終極密碼**（每頻道一局）",
+    `- \`${PREFIX_UP} start [min] [max]\`：開始（預設 1~100）`,
+    `- \`${PREFIX_UP} <數字>\`：猜答案`,
+    `- \`${PREFIX_UP} status\`：看目前範圍與次數`,
+    `- \`${PREFIX_UP} reset\`：重置本頻道`,
+    `- \`${PREFIX_UP} end\`：結束（管理員/開局者）`,
+    "",
+    "**數字接龍 Counting**（每頻道一局）",
+    `- \`${PREFIX_COUNT} start [起始數]\`：開始（預設從 1 開始）`,
+    `- 直接在頻道輸入數字：進行接龍（必須是下一個數）`,
+    `- \`${PREFIX_COUNT} status\`：看目前下一個要接的數`,
+    `- \`${PREFIX_COUNT} reset\`：重置本頻道`,
+    `- \`${PREFIX_COUNT} end\`：結束（管理員/開局者）`,
+  ].join("\n");
 }
 
-async function startHL(interaction) {
-  if (!mustInGuild(interaction)) return;
-  await safeDefer(interaction, false);
+// -------------------- Ultimate Password --------------------
+async function upHandle(message, args) {
+  const cid = chanId(message);
+  const sub = (args[0] || "").toLowerCase();
 
-  const key = roomKey(interaction.guildId, interaction.channelId);
-  const existing = rooms.get(key);
-  if (existing && existing.active) {
-    return safeEdit(interaction, {
-      content: `⚠️ 本頻道已有進行中的遊戲：**${existing.type}**（請先 /stop 停止）`,
+  // help
+  if (sub === "help" || sub === "h" || sub === "?") {
+    return safeReply(message, helpText());
+  }
+
+  // start
+  if (sub === "start") {
+    // !up start [min] [max]
+    let low = 1;
+    let high = 100;
+
+    const a1 = args[1];
+    const a2 = args[2];
+    const n1 = a1 !== undefined ? parseIntSafe(a1) : null;
+    const n2 = a2 !== undefined ? parseIntSafe(a2) : null;
+
+    if (n1 !== null && n2 !== null) {
+      low = n1;
+      high = n2;
+    } else if (n1 !== null && n2 === null) {
+      // 只給一個數字就當上限：1~n1
+      low = 1;
+      high = n1;
+    }
+
+    [low, high] = clampRange(low, high);
+
+    if (high - low < 5) {
+      return safeReply(message, "⚠️ 範圍太小了，至少要差 5 以上喔（例如 1~100）。");
+    }
+
+    const answer = pickAnswer(low, high);
+    upState.set(cid, {
+      active: true,
+      low,
+      high,
+      answer,
+      tries: 0,
+      startedBy: message.author.id,
+      startedAt: now(),
     });
+
+    return safeReply(
+      message,
+      `🔐 **終極密碼開始！**\n範圍：**${low} ~ ${high}**\n用 \`${PREFIX_UP} <數字>\` 來猜！`
+    );
   }
 
-  const room = createHLRoom(interaction.guildId, interaction.channelId, interaction.user.id);
-  rooms.set(key, room);
+  // status
+  if (sub === "status") {
+    const st = upState.get(cid);
+    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的終極密碼。用 `!up start` 開始。");
+    return safeReply(
+      message,
+      `🔐 **終極密碼狀態**\n範圍：**${st.low} ~ ${st.high}**\n嘗試次數：**${st.tries}**`
+    );
+  }
 
-  const embed = new EmbedBuilder()
-    .setTitle("🃏 高低牌（HL）")
-    .setDescription(
-      `目前牌：**${cardText(room.meta.current)}**\n` +
-        `由 <@${room.meta.playerId}> 進行挑戰。\n\n` +
-        `每次猜對 **+5 分**（立即更新按鈕訊息）。`
-    )
-    .setFooter({ text: "按下「更高 / 更低」開始" });
+  // reset
+  if (sub === "reset") {
+    upState.delete(cid);
+    return safeReply(message, "♻️ 已重置本頻道的終極密碼狀態。");
+  }
 
-  await safeEdit(interaction, { embeds: [embed], components: hlComponents(false) });
+  // end
+  if (sub === "end" || sub === "stop") {
+    const st = upState.get(cid);
+    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的終極密碼。");
 
-  try {
-    const sent = await interaction.fetchReply();
-    room.meta.messageId = sent.id;
-  } catch {}
+    const allowed = st.startedBy === message.author.id || isAdminLike(message.member);
+    if (!allowed) return safeReply(message, "⛔ 只有開局者或管理員可以結束這局。");
+
+    upState.delete(cid);
+    return safeReply(message, "🧹 已結束本頻道的終極密碼。");
+  }
+
+  // guess number: !up 50
+  const st = upState.get(cid);
+  const guess = parseIntSafe(sub);
+
+  if (guess === null) {
+    return safeReply(message, "❓ 指令不懂。輸入 `!up help` 看用法。");
+  }
+
+  if (!st?.active) {
+    return safeReply(message, "ℹ️ 本頻道還沒開始終極密碼。用 `!up start` 開始。");
+  }
+
+  st.tries += 1;
+
+  if (guess <= st.low || guess >= st.high) {
+    return safeReply(message, `⚠️ 你猜的 **${guess}** 不在目前有效範圍（必須介於 **${st.low}** 和 **${st.high}** 之間）。`);
+  }
+
+  if (guess === st.answer) {
+    upState.delete(cid);
+    return safeReply(
+      message,
+      `🎉 ${mention(message.author.id)} **猜中了！答案就是 ${guess}**\n（本局共嘗試 ${st.tries} 次）\n再來一局：\`${PREFIX_UP} start\``
+    );
+  }
+
+  if (guess < st.answer) st.low = guess;
+  else st.high = guess;
+
+  upState.set(cid, st);
+
+  return safeReply(message, `🔎 ${mention(message.author.id)} 目前範圍：**${st.low} ~ ${st.high}**（第 ${st.tries} 次）`);
 }
 
-async function stopHLRoom(interaction, room, reason = "stopped") {
-  room.active = false;
-  room.log.push({ ts: now(), type: "stop", by: interaction.user.id, reason });
-  pushHistoryIfEnded(room, { stoppedBy: interaction.user.id });
-  deleteRoom(room.guildId, room.channelId);
+// -------------------- Counting --------------------
+async function countHandleCommand(message, args) {
+  const cid = chanId(message);
+  const sub = (args[0] || "").toLowerCase();
 
-  const embed = new EmbedBuilder()
-    .setTitle("🃏 高低牌（HL）已結束")
-    .setDescription(`本局結束。勝利次數：**${room.meta.wins}**`)
-    .setFooter({ text: "你可以重新 /hl 開新局" });
-
-  return interaction.update({ embeds: [embed], components: hlComponents(true) });
-}
-
-async function handleHLButton(interaction, room, pick) {
-  // 房間已關
-  if (!room.active) {
-    return interaction.reply({ content: "⚠️ 這局已結束。", ephemeral: true }).catch(() => {});
+  // help
+  if (sub === "help" || sub === "h" || sub === "?") {
+    return safeReply(message, helpText());
   }
 
-  // 只允許開局者玩
-  if (interaction.user.id !== room.meta.playerId) {
-    return interaction.reply({ content: "❌ 只有開局者可以操作。", ephemeral: true }).catch(() => {});
-  }
+  // start
+  if (sub === "start") {
+    // !count start [startNumber]  -> next should be startNumber (default 1)
+    const startN = args[1] !== undefined ? parseIntSafe(args[1]) : 1;
+    if (startN === null) return safeReply(message, "⚠️ 起始數必須是整數。例：`!count start 1`");
 
-  const prev = room.meta.current;
-  const next = drawCard();
-  room.meta.rounds += 1;
-
-  const isHigh = next > prev;
-  const isLow = next < prev;
-  const isTie = next === prev;
-
-  let ok = false;
-  if (!isTie) {
-    if (pick === "high" && isHigh) ok = true;
-    if (pick === "low" && isLow) ok = true;
-  }
-
-  room.log.push({
-    ts: now(),
-    type: "round",
-    userId: interaction.user.id,
-    prev,
-    next,
-    pick,
-    ok,
-  });
-
-  if (ok) {
-    room.meta.current = next;
-    room.meta.wins += 1;
-
-    // 猜對立刻加分 + 更新訊息
-    try {
-      await award(interaction, interaction.user.id, 5, "hl_win");
-    } catch {
-      await interaction.followUp({ content: "⚠️ 加分失敗，請稍後再試。", ephemeral: true }).catch(() => {});
-    }
-
-    const embed = new EmbedBuilder()
-      .setTitle("🃏 高低牌（HL）")
-      .setDescription(
-        `上一張：**${cardText(prev)}**\n` +
-          `新牌：**${cardText(next)}**\n\n` +
-          `✅ 猜對！<@${interaction.user.id}> 獲得 **+5 分**\n` +
-          `目前連勝：**${room.meta.wins}**`
-      )
-      .setFooter({ text: "繼續猜！" });
-
-    return interaction.update({ embeds: [embed], components: hlComponents(false) });
-  }
-
-  // 猜錯 or 平手 -> 結束
-  room.active = false;
-  pushHistoryIfEnded(room, { winnerId: interaction.user.id, endedByMistake: true });
-  deleteRoom(room.guildId, room.channelId);
-
-  const embed = new EmbedBuilder()
-    .setTitle("🃏 高低牌（HL）結束")
-    .setDescription(
-      `上一張：**${cardText(prev)}**\n` +
-        `新牌：**${cardText(next)}**\n\n` +
-        (isTie ? "🤝 平手（視為失敗結束）\n" : "❌ 猜錯了！\n") +
-        `本局連勝：**${room.meta.wins}**`
-    )
-    .setFooter({ text: "你可以重新 /hl 開新局" });
-
-  return interaction.update({ embeds: [embed], components: hlComponents(true) });
-}
-
-/* ==============================
-   Stop command (停止本頻道遊戲)
-================================ */
-
-async function stopAny(interaction) {
-  if (!mustInGuild(interaction)) return;
-  await safeDefer(interaction, false);
-
-  const room = getRoom(interaction.guildId, interaction.channelId);
-  if (!room || !room.active) {
-    return safeEdit(interaction, { content: "⚠️ 本頻道沒有進行中的遊戲。" });
-  }
-
-  // 允許：房主 or 管理員 停止
-  const member = interaction.member;
-  const isOwner = room.ownerId === interaction.user.id;
-  const isAdmin = isAdminMember(member);
-
-  if (!isOwner && !isAdmin) {
-    return safeEdit(interaction, { content: "❌ 只有開局者或管理員可以停止。" });
-  }
-
-  room.active = false;
-  room.log.push({ ts: now(), type: "stop", by: interaction.user.id });
-
-  pushHistoryIfEnded(room, { stoppedBy: interaction.user.id });
-  deleteRoom(interaction.guildId, interaction.channelId);
-
-  return safeEdit(interaction, { content: `✅ 已停止：${room.type}` });
-}
-
-/* ==============================
-   Leaderboard / Rank helpers
-================================ */
-
-async function renderTop10Embed(_guild, top) {
-  const embed = new EmbedBuilder().setTitle("🏆 排行榜 Top 10").setDescription("（依積分排序）");
-
-  if (!top || top.length === 0) {
-    embed.setDescription("目前沒有資料。");
-    return embed;
-  }
-
-  const lines = [];
-  for (let i = 0; i < top.length; i++) {
-    const row = top[i];
-    const userId = row.userId || row.uid || row.id;
-    const pts = row.points ?? row.value ?? row.score ?? 0;
-    lines.push(`**${i + 1}.** <@${userId}> — **${pts}** 分`);
-  }
-
-  embed.setDescription(lines.join("\n"));
-  return embed;
-}
-
-/* ==============================
-   Public APIs for Admin Web
-================================ */
-
-function getRoomsSnapshot() {
-  const arr = [];
-  for (const r of rooms.values()) {
-    arr.push({
-      guildId: r.guildId,
-      channelId: r.channelId,
-      type: r.type,
-      active: !!r.active,
-      createdAt: r.createdAt,
-      ownerId: r.ownerId,
-      meta: r.meta,
-      logCount: r.log.length,
-      lastLog: r.log[r.log.length - 1] || null,
+    countState.set(cid, {
+      active: true,
+      next: startN,
+      lastUserId: null,
+      startedBy: message.author.id,
+      startedAt: now(),
+      streak: 0,
     });
+
+    return safeReply(
+      message,
+      `🔢 **數字接龍開始！**\n下一個要接：**${startN}**\n直接在頻道輸入數字即可（例如：\`${startN}\`）。`
+    );
   }
-  return arr;
+
+  // status
+  if (sub === "status") {
+    const st = countState.get(cid);
+    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的數字接龍。用 `!count start` 開始。");
+    return safeReply(message, `🔢 **數字接龍狀態**\n下一個要接：**${st.next}**\n連續成功：**${st.streak}**`);
+  }
+
+  // reset
+  if (sub === "reset") {
+    countState.delete(cid);
+    return safeReply(message, "♻️ 已重置本頻道的數字接龍狀態。");
+  }
+
+  // end
+  if (sub === "end" || sub === "stop") {
+    const st = countState.get(cid);
+    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的數字接龍。");
+
+    const allowed = st.startedBy === message.author.id || isAdminLike(message.member);
+    if (!allowed) return safeReply(message, "⛔ 只有開局者或管理員可以結束。");
+
+    countState.delete(cid);
+    return safeReply(message, "🧹 已結束本頻道的數字接龍。");
+  }
+
+  return safeReply(message, "❓ 指令不懂。輸入 `!count help` 看用法。");
 }
 
-function getHistory7d() {
-  return history7d.slice(-200);
+async function countHandleNumberMessage(message) {
+  const cid = chanId(message);
+  const st = countState.get(cid);
+  if (!st?.active) return;
+
+  const n = parseIntSafe(message.content);
+  if (n === null) return;
+
+  // 防同一人連續
+  if (st.lastUserId && st.lastUserId === message.author.id) {
+    // 這裡我選擇「提醒但不結束」，避免太兇
+    return safeReply(message, `⚠️ ${mention(message.author.id)} 不能連續接兩次，換別人接：**${st.next}**`);
+  }
+
+  if (n !== st.next) {
+    // 錯了就重置到起始（或你想要直接 end 也可以）
+    const expected = st.next;
+    const restart = (st.next - st.streak); // 估算起始，保持概念，不依賴外部
+    countState.set(cid, {
+      active: true,
+      next: expected, // 保持下一個不變也可以，但這裡選擇直接重置到 1
+      lastUserId: null,
+      startedBy: st.startedBy,
+      startedAt: st.startedAt,
+      streak: 0,
+    });
+
+    // 我這裡改成「直接重置到 1」，更常見
+    const resetTo = 1;
+    countState.set(cid, {
+      active: true,
+      next: resetTo,
+      lastUserId: null,
+      startedBy: st.startedBy,
+      startedAt: st.startedAt,
+      streak: 0,
+    });
+
+    return safeReply(
+      message,
+      `💥 錯了！你輸入 **${n}**，應該要是 **${expected}**。\n已重置，下一個請輸入：**${resetTo}**`
+    );
+  }
+
+  // correct
+  st.lastUserId = message.author.id;
+  st.next += 1;
+  st.streak += 1;
+  countState.set(cid, st);
+
+  // 不狂洗頻道：每 10 次回一次，或你也可以改成每次都回
+  if (st.streak % 10 === 0) {
+    return safeReply(message, `✅ 目前連續成功：**${st.streak}**，下一個：**${st.next}**`);
+  }
 }
 
-/**
- * ✅ 給 Web 後台/系統用：用 guildId + channelId 直接強制停止
- * - game 先保留（你之後要做「只停 hl」之類才用得到）
- */
-function forceStopByChannelId(guildId, channelId, game = "all") {
-  const room = getRoom(guildId, channelId);
-  if (!room || !room.active) return false;
-
-  room.active = false;
-  room.log.push({ ts: now(), type: "force_stop", by: "admin", game });
-
-  pushHistoryIfEnded(room, { stoppedBy: "admin", forced: true });
-  deleteRoom(guildId, channelId);
-  return true;
-}
-
-/* ==============================
-   Main handlers
-================================ */
-
-async function handleInteraction(_client, interaction) {
+// -------------------- Entry --------------------
+async function onMessage(message, { client, webRuntime } = {}) {
   try {
-    // Slash Commands
-    if (interaction.isChatInputCommand()) {
-      const name = interaction.commandName;
+    if (!message || message.author?.bot) return;
+    if (!message.guild) return; // 只處理伺服器內訊息（要支援私訊可移除）
 
-      if (name === "guess") return startGuess(interaction);
-      if (name === "counting") return startCounting(interaction);
-      if (name === "hl") return startHL(interaction);
-      if (name === "stop") return stopAny(interaction);
+    const content = (message.content || "").trim();
+    if (!content) return;
 
-      if (name === "rank") {
-        if (!mustInGuild(interaction)) return;
-        await safeDefer(interaction, false);
-
-        const top = await getTopPoints(10);
-        const embed = await renderTop10Embed(interaction.guild, top);
-        return safeEdit(interaction, { embeds: [embed] });
-      }
-
-      // （可選）points：顯示自己的點數
-      if (name === "points") {
-        await safeDefer(interaction, true);
-        const p = await getPoints(interaction.user.id);
-        return safeEdit(interaction, { content: `⭐ 你的目前積分：**${p}**` });
-      }
-
-      return;
+    // help
+    if (content === "!game" || content === "!games" || content === "!help") {
+      return safeReply(message, helpText());
     }
 
-    // Buttons
-    if (interaction.isButton()) {
-      const room = getRoom(interaction.guildId, interaction.channelId);
-
-      // HL buttons
-      if (
-        interaction.customId === "hl_high" ||
-        interaction.customId === "hl_low" ||
-        interaction.customId === "hl_stop"
-      ) {
-        if (!room || room.type !== "hl") {
-          return interaction
-            .reply({ content: "⚠️ 本頻道沒有進行中的 HL。", ephemeral: true })
-            .catch(() => {});
-        }
-
-        if (interaction.customId === "hl_stop") {
-          const member = interaction.member;
-          const isOwner = room.ownerId === interaction.user.id;
-          const isAdmin = isAdminMember(member);
-          if (!isOwner && !isAdmin) {
-            return interaction
-              .reply({ content: "❌ 只有開局者或管理員可以停止。", ephemeral: true })
-              .catch(() => {});
-          }
-          return stopHLRoom(interaction, room, "manual_stop");
-        }
-
-        const pick = interaction.customId === "hl_high" ? "high" : "low";
-        return handleHLButton(interaction, room, pick);
-      }
-
-      return;
+    // Ultimate Password commands
+    if (content.toLowerCase().startsWith(PREFIX_UP)) {
+      const args = content.split(/\s+/).slice(1);
+      return upHandle(message, args);
     }
-  } catch (e) {
-    try {
-      if (interaction && (interaction.deferred || interaction.replied)) {
-        await interaction.editReply("❌ 發生錯誤，請稍後再試。");
-      } else if (interaction) {
-        await interaction.reply({ content: "❌ 發生錯誤，請稍後再試。", ephemeral: true });
-      }
-    } catch {}
-    console.error("[Games] handleInteraction error:", e);
+
+    // Counting commands
+    if (content.toLowerCase().startsWith(PREFIX_COUNT)) {
+      const args = content.split(/\s+/).slice(1);
+      return countHandleCommand(message, args);
+    }
+
+    // Counting number messages (only if counting active)
+    await countHandleNumberMessage(message);
+  } catch (err) {
+    console.error("❌ [Games] onMessage error:", err);
   }
 }
 
-async function handleMessage(_client, msg) {
-  try {
-    if (!msg.guild || !msg.channel) return;
-    if (msg.author?.bot) return;
-
-    const room = getRoom(msg.guild.id, msg.channel.id);
-    if (!room || !room.active) return;
-
-    // counting / guess 不互相干擾
-    if (room.type === "guess") return handleGuessMessage(msg, room);
-    if (room.type === "counting") return handleCountingMessage(msg, room);
-
-    // HL 只吃按鈕，不吃訊息
-    return;
-  } catch (e) {
-    console.error("[Games] handleMessage error:", e);
-  }
-}
-
-/* ==============================
-   Slash Commands definition (optional)
-================================ */
-
-const commands = [
-  { name: "guess", description: "開始終極密碼（在本頻道）" },
-  { name: "counting", description: "開始 Counting（在本頻道）" },
-  { name: "hl", description: "開始高低牌（按鈕遊戲）" },
-  { name: "stop", description: "停止本頻道進行中的遊戲" },
-  { name: "rank", description: "查看排行榜" },
-  { name: "points", description: "查看我的積分" },
-];
-
-module.exports = {
-  handleInteraction,
-  handleMessage,
-
-  // 給你的 web 後台用
-  getRoomsSnapshot,
-  getHistory7d,
-  forceStopByChannelId,
-
-  // 給註冊指令用（可選）
-  commands,
-};
+module.exports = { onMessage };
