@@ -8,9 +8,8 @@
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const commands = require("./bot/commands"); // 你貼的那份 commands.js (commandData + execute)
+const commands = require("./bot/commands"); // commands.js (commandData + execute)
 const gamesMod = require("./bot/games");    // games.js：module.exports = { games, onMessage }
-const initFirebase = require("./db/firebase"); // 你原本的 Firebase 初始化（如果沒有就刪掉）
 
 // ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -29,13 +28,37 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// ---- bootstrap ----
-initFirebase?.(); // 有就跑，沒有就忽略
+// ---- bootstrap (Firebase) ----
+// ✅ 兼容三種 export：
+// 1) module.exports = initFirebase
+// 2) module.exports = { initFirebase }
+// 3) exports.default = initFirebase
+let initFirebaseFn = null;
+try {
+  const fb = require("./db/firebase"); // 你原本的路徑
+  initFirebaseFn =
+    (typeof fb === "function" && fb) ||
+    (typeof fb?.initFirebase === "function" && fb.initFirebase) ||
+    (typeof fb?.default === "function" && fb.default) ||
+    null;
+} catch (_) {
+  initFirebaseFn = null;
+}
 
+if (initFirebaseFn) {
+  try {
+    initFirebaseFn();
+  } catch (e) {
+    console.error("[Firebase] init failed:", e);
+  }
+} else {
+  console.warn("[Firebase] initFirebase not found or not a function (skipped)");
+}
+
+// ---- ready ----
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
-  // 註冊 slash commands（你目前 log 顯示 guild 註冊成功）
   try {
     await registerCommands(client);
     console.log("[Commands] registered");
@@ -46,16 +69,15 @@ client.once("ready", async () => {
 
 // ✅ 確保「只」有一個 interactionCreate handler
 client.on("interactionCreate", async (interaction) => {
-  try {
-    if (!interaction.isChatInputCommand()) return;
+  if (!interaction.isChatInputCommand()) return;
 
+  try {
     // 1) 先 ACK：統一 defer（避免 3 秒超時 Unknown interaction 10062）
-    //    用 flags 取代 ephemeral（避免你 log 的 deprecated warning）
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
 
-    // 2) 執行指令（commands.js 裡只能 editReply/followUp）
+    // 2) 執行指令（commands.js 裡「不能再 reply()」，只能 editReply/followUp）
     await commands.execute(interaction, { client });
 
   } catch (err) {
