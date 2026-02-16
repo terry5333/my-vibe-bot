@@ -1,75 +1,89 @@
 "use strict";
 
-const { REST, Routes, SlashCommandBuilder } = require("discord.js");
+const { Collection, REST, Routes, SlashCommandBuilder } = require("discord.js");
 
-function buildCommands() {
-  const cmds = [];
+/** ✅ 這裡放「指令處理器」(runtime 用) */
+const commands = new Collection();
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("rank")
-      .setDescription("查看排行榜（秒回）")
-  );
+/** ========= /points ========= */
+commands.set("points", {
+  data: new SlashCommandBuilder()
+    .setName("points")
+    .setDescription("查看自己的積分"),
+  async execute(interaction, ctx) {
+    const userId = interaction.user.id;
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("points")
-      .setDescription("查看自己的積分")
-  );
+    // 你的 points.js 是 getPoints / setPoints / addPoints
+    const pointsDb = require("../db/points.js");
+    const pts = await pointsDb.getPoints(userId);
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("guess")
-      .setDescription("開始終極密碼（此頻道）")
-      .addIntegerOption((o) => o.setName("min").setDescription("最小值").setRequired(true))
-      .addIntegerOption((o) => o.setName("max").setDescription("最大值").setRequired(true))
-  );
+    await interaction.editReply(`✅ 你的積分：${pts}`);
+  },
+});
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("hl")
-      .setDescription("開始高低牌（你自己一局）")
-  );
+/** ========= /rank ========= */
+commands.set("rank", {
+  data: new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("查看排行榜前幾名")
+    .addIntegerOption((opt) =>
+      opt.setName("top").setDescription("顯示前幾名（預設 10）").setMinValue(1).setMaxValue(50)
+    ),
+  async execute(interaction, ctx) {
+    const top = interaction.options.getInteger("top") || 10;
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("counting")
-      .setDescription("開始Counting（此頻道）")
-  );
+    // 你目前 points.js 沒有 getLeaderboard，所以先用簡易版（讀全部 points）
+    const { getDB } = require("../db/firebase");
+    const db = getDB();
+    const snap = await db.ref("points").get();
+    const all = snap.val() || {};
 
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("stop")
-      .setDescription("強制停止此頻道的遊戲（需要管理權限）")
-  );
+    const rows = Object.entries(all)
+      .map(([userId, points]) => ({ userId, points: Number(points || 0) }))
+      .sort((a, b) => b.points - a.points)
+      .slice(0, top);
 
-  return cmds.map((c) => c.toJSON());
+    if (!rows.length) return interaction.editReply("目前沒有排行榜資料。");
+
+    const lines = await Promise.all(
+      rows.map(async (r, i) => {
+        const u = await interaction.client.users.fetch(r.userId).catch(() => null);
+        const name = u?.username || r.userId;
+        return `${i + 1}. ${name} — ${r.points}`;
+      })
+    );
+
+    await interaction.editReply(`🏆 排行榜 Top ${top}\n` + lines.join("\n"));
+  },
+});
+
+/** ✅ 把 commands 塞到 client.commands，events.js 才找得到 */
+function loadCommands(client) {
+  client.commands = commands;
+  console.log(`[Commands] Loaded ${commands.size} handlers into client.commands`);
 }
 
+/** ✅ 註冊 slash commands 到 Discord（你現在已經有做，但我給你穩定版） */
 async function registerCommands() {
   const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.CLIENT_ID;
-  const guildId = process.env.GUILD_ID;
+  const clientId = process.env.CLIENT_ID; // ✅ 你要在 ENV 放 bot 的 Client ID
+  const guildId = process.env.GUILD_ID;   // （可選）填了就「秒生效」，不填就是 global 可能等幾分鐘
 
   if (!token || !clientId) {
-    console.log("⚠️ 跳過註冊指令（缺 DISCORD_TOKEN / CLIENT_ID）");
+    console.warn("[Commands] ⚠️ 缺少 DISCORD_TOKEN 或 CLIENT_ID，略過註冊");
     return;
   }
 
   const rest = new REST({ version: "10" }).setToken(token);
-  const body = buildCommands();
+  const body = [...commands.values()].map((c) => c.data.toJSON());
 
-  try {
-    if (guildId) {
-      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body });
-      console.log("[Commands] Registered GUILD slash commands");
-    } else {
-      await rest.put(Routes.applicationCommands(clientId), { body });
-      console.log("[Commands] Registered GLOBAL slash commands");
-    }
-  } catch (e) {
-    console.error("❌ Register commands failed:", e);
+  if (guildId) {
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body });
+    console.log("[Commands] Registered GUILD slash commands");
+  } else {
+    await rest.put(Routes.applicationCommands(clientId), { body });
+    console.log("[Commands] Registered GLOBAL slash commands");
   }
 }
 
-module.exports = { registerCommands };
+module.exports = { loadCommands, registerCommands, commands };
