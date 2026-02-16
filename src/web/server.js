@@ -2,116 +2,80 @@
 
 /**
  * src/web/server.js
- * ✅ 後台完整版本：
- * - 具備 attachRuntime()（解決：TypeError: attachRuntime is not a function）
- * - 側邊選單 UI（Dashboard/Leaderboard/Players/Rooms/History/Settings）
- * - 排行榜、玩家列表、調分
- * - 顯示 Discord 頭像 + 名稱（能抓到就顯示，抓不到就顯示 userId）
- * - API 都有錯誤輸出，方便除錯
+ * 中文後台（側邊選單、搜尋玩家、加減分按鈕、排行榜、中文設定表單）
  */
 
-const path = require("path");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
+const admin = require("firebase-admin");
 
-/* -------------------- Safe require -------------------- */
-function safeRequire(p) {
-  try {
-    // eslint-disable-next-line import/no-dynamic-require, global-require
-    return require(p);
-  } catch (e) {
-    console.warn(`[Web] ⚠️ 找不到模組：${p}（先用空功能代替）`);
-    return null;
-  }
-}
+/* -------------------- Firebase DB 取得（如果你已有 db/firebase.js 可改用那份） -------------------- */
+let _db = null;
 
-/**
- * 依你的專案結構載入 DB：
- * points.js 你已經有：getPoints/setPoints/addPoints
- * 但後台還會用到：
- * - getLeaderboard(top)
- * - getAllPlayers()
- * 如果你沒有，後台會用 fallback（從 points 全部掃）
- */
-const pointsDb = safeRequire(path.join(__dirname, "../db/points.js"));
-const firebaseDbMod = safeRequire(path.join(__dirname, "../db/firebase.js"));
-const roomsDb = safeRequire(path.join(__dirname, "../db/rooms.js"));
-const historyDb = safeRequire(path.join(__dirname, "../db/history.js"));
-const botState = safeRequire(path.join(__dirname, "../bot/state.js"));
+function getDb() {
+  if (_db) return _db;
 
-/* ================= Runtime (Discord client, etc.) ================= */
-const runtime = {
-  client: null,
-  app: null,
-};
+  if (!admin.apps.length) {
+    const rawUrl =
+      process.env.FIREBASE_DB_URL ||
+      process.env.FIREBASE_DATABASE_URL ||
+      process.env.DATABASE_URL;
 
-function attachRuntime(webRuntime, { client } = {}) {
-  // 允許你傳 startWeb() 的回傳值，也允許不傳
-  runtime.client = client || runtime.client || null;
-
-  if (webRuntime && webRuntime.app) runtime.app = webRuntime.app;
-  return runtime;
-}
-
-async function resolveDiscordUser(userId) {
-  const client = runtime.client;
-  if (!client) return null;
-
-  // 先從 cache 找
-  try {
-    const cached = client.users?.cache?.get?.(userId);
-    if (cached) {
-      return {
-        id: cached.id,
-        username: cached.username,
-        displayName: cached.globalName || cached.username,
-        avatar: cached.displayAvatarURL?.({ size: 64 }) || null,
-      };
+    if (!rawUrl) {
+      throw new Error("❌ 缺少 FIREBASE_DB_URL（Realtime Database 的網址）");
     }
-  } catch {}
 
-  // 再 fetch
-  try {
-    const u = await client.users.fetch(userId);
-    if (!u) return null;
-    return {
-      id: u.id,
-      username: u.username,
-      displayName: u.globalName || u.username,
-      avatar: u.displayAvatarURL?.({ size: 64 }) || null,
-    };
-  } catch {
-    return null;
+    // 只留 origin（避免你貼到 console 的網址或帶 /data 之類）
+    const url = new URL(rawUrl).origin;
+
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+      admin.initializeApp({
+        credential: admin.credential.cert(sa),
+        databaseURL: url,
+      });
+    } else {
+      // 如果你的平台不是 GCP 可能會需要上面的 service account
+      admin.initializeApp({ databaseURL: url });
+    }
   }
+
+  _db = admin.database();
+  return _db;
 }
 
-function userFallback(userId) {
-  return {
-    id: userId,
-    username: null,
-    displayName: null,
-    avatar: null,
-  };
-}
-
-/* ================= ENV ================= */
-const { JWT_SECRET, ADMIN_USER, ADMIN_PASS } = process.env;
-
-if (!JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) {
-  console.error("❌ 缺少 ENV：JWT_SECRET / ADMIN_USER / ADMIN_PASS");
-}
-
-/* ================= App / Middleware ================= */
+/* -------------------- Express -------------------- */
 const app = express();
-runtime.app = app;
 
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-/* ================= Helpers ================= */
+/* -------------------- ENV -------------------- */
+const { JWT_SECRET, ADMIN_USER, ADMIN_PASS } = process.env;
+
+if (!JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) {
+  console.error("❌ 缺少 ENV：JWT_SECRET / ADMIN_USER / ADMIN_PASS");
+}
+
+/* -------------------- Runtime（讓 web 拿到 discord client） -------------------- */
+const runtime = {
+  app,
+  client: null,
+};
+
+function attachRuntime(webRuntime, { client }) {
+  // 你在 index.js 裡呼叫 attachRuntime(startWeb(), { client })
+  if (webRuntime && typeof webRuntime === "object") {
+    webRuntime.client = client;
+  }
+  runtime.client = client;
+  return webRuntime;
+}
+
+/* -------------------- Helpers -------------------- */
 function isHttps(req) {
   return !!(req.secure || req.headers["x-forwarded-proto"] === "https");
 }
@@ -124,7 +88,7 @@ function verifyToken(token) {
   return jwt.verify(token, JWT_SECRET);
 }
 
-function auth(req, res, next) {
+function authPage(req, res, next) {
   const token = req.cookies?.admin_token;
   if (!token) return res.redirect("/admin/login");
   try {
@@ -135,7 +99,7 @@ function auth(req, res, next) {
   }
 }
 
-function apiAuth(req, res, next) {
+function authApi(req, res, next) {
   const token = req.cookies?.admin_token;
   if (!token) return res.status(401).json({ ok: false, error: "UNAUTH" });
   try {
@@ -146,26 +110,39 @@ function apiAuth(req, res, next) {
   }
 }
 
-function jsonOK(res, data) {
+function ok(res, data = {}) {
   return res.json({ ok: true, ...data });
 }
 
-/* ================= Root / Health ================= */
-app.get("/", (req, res) => res.send("OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
+function err(res, code, message) {
+  return res.status(code).json({ ok: false, error: message || "ERROR" });
+}
 
-/* ================= Login ================= */
+/* -------------------- DB 路徑（你如果想改成每個伺服器一份，就把 points 改成 points/{guildId}/{userId}） -------------------- */
+function pointsRef(userId) {
+  return getDb().ref(`points/${userId}`);
+}
+
+function settingsRef(guildId) {
+  // guildId = "global" 時就是全域設定
+  return getDb().ref(`settings/${guildId || "global"}`);
+}
+
+/* -------------------- 基本頁面 -------------------- */
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => ok(res, { status: "ok" }));
+
+/* -------------------- 登入頁 -------------------- */
 app.get("/admin/login", (req, res) => {
-  const err = req.query?.err;
+  const showErr = Boolean(req.query?.err);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(loginHtml(Boolean(err)));
+  res.end(loginHtml(showErr));
 });
 
 app.post("/admin/login", (req, res) => {
   const { user, pass } = req.body || {};
   if (user === ADMIN_USER && pass === ADMIN_PASS) {
     const token = signToken({ user });
-
     res.cookie("admin_token", token, {
       httpOnly: true,
       secure: isHttps(req),
@@ -173,7 +150,6 @@ app.post("/admin/login", (req, res) => {
       maxAge: 12 * 60 * 60 * 1000,
       path: "/",
     });
-
     return res.redirect("/admin");
   }
   return res.redirect("/admin/login?err=1");
@@ -184,549 +160,542 @@ app.get("/admin/logout", (req, res) => {
   res.redirect("/admin/login");
 });
 
-/* ================= Admin UI ================= */
-app.get("/admin", auth, (req, res) => {
+/* -------------------- 後台 UI -------------------- */
+app.get("/admin", authPage, (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(adminHtml());
 });
 
-/* ================= Points fallback (如果你 pointsDb 沒提供 list API) ================= */
-async function fallbackListAllPoints() {
-  // 需要 firebase.js 有 getDB
-  const getDB = firebaseDbMod?.getDB;
-  if (!getDB) return [];
-  const db = getDB();
-  const snap = await db.ref("points").get();
-  const val = snap.val() || {};
-  return Object.entries(val).map(([userId, points]) => ({
-    userId,
-    points: Number(points || 0),
-  }));
-}
-
-async function getAllPlayersRows() {
-  if (pointsDb?.getAllPlayers) return await pointsDb.getAllPlayers();
-  // fallback: scan points/*
-  return await fallbackListAllPoints();
-}
-
-async function getLeaderboardRows(top = 20) {
-  if (pointsDb?.getLeaderboard) return await pointsDb.getLeaderboard(top);
-
-  // fallback: scan + sort
-  const rows = await fallbackListAllPoints();
-  rows.sort((a, b) => Number(b.points) - Number(a.points));
-  return rows.slice(0, top);
-}
-
-/* ================= Admin APIs ================= */
-
-/** 讀排行榜 */
-app.get("/admin/api/leaderboard", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：伺服器清單（只列「伺服器」，不是成員）
+ * ======================================================================= */
+app.get("/admin/api/guilds", authApi, async (req, res) => {
   try {
-    const top = Math.max(1, Math.min(200, Number(req.query?.top || 20)));
-    const rows = await getLeaderboardRows(top);
+    const client = runtime.client;
+    if (!client) return ok(res, { guilds: [] });
 
-    // enrich with discord user
-    const enriched = await Promise.all(
-      rows.map(async (r) => {
-        const u = (await resolveDiscordUser(r.userId)) || userFallback(r.userId);
-        return {
-          userId: r.userId,
-          points: Number(r.points || 0),
-          name: u.displayName || u.username || null,
-          avatar: u.avatar,
-        };
-      })
-    );
+    const guilds = client.guilds?.cache
+      ? Array.from(client.guilds.cache.values()).map((g) => ({
+          id: g.id,
+          name: g.name,
+          icon: g.iconURL?.({ size: 64 }) || null,
+        }))
+      : [];
 
-    return jsonOK(res, { rows: enriched });
+    return ok(res, { guilds });
   } catch (e) {
-    console.error("[Web] leaderboard error:", e);
-    return res.status(500).json({ ok: false, error: "LEADERBOARD_FAILED" });
+    console.error("[Web] guilds error:", e);
+    return err(res, 500, "GUILDS_FAILED");
   }
 });
 
-/** 讀玩家清單 */
-app.get("/admin/api/players", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：搜尋成員（不列出全員，只用 query 搜）
+ *  GET /admin/api/member/search?guildId=xxx&q=abc
+ * ======================================================================= */
+app.get("/admin/api/member/search", authApi, async (req, res) => {
   try {
-    const rows = await getAllPlayersRows();
+    const client = runtime.client;
+    const guildId = String(req.query?.guildId || "");
+    const q = String(req.query?.q || "").trim();
 
-    // enrich
-    const enriched = await Promise.all(
-      rows.map(async (r) => {
-        const u = (await resolveDiscordUser(r.userId)) || userFallback(r.userId);
-        return {
-          userId: r.userId,
-          points: Number(r.points || 0),
-          name: u.displayName || u.username || null,
-          avatar: u.avatar,
-        };
-      })
-    );
+    if (!client) return ok(res, { members: [] });
+    if (!guildId) return err(res, 400, "NEED_GUILD_ID");
+    if (!q || q.length < 2) return ok(res, { members: [] });
 
-    // 預設按分數排序（高到低）
-    enriched.sort((a, b) => Number(b.points) - Number(a.points));
-    return jsonOK(res, { rows: enriched });
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return err(res, 404, "GUILD_NOT_FOUND");
+
+    // Discord API 搜尋（不會抓全員）
+    const result = await guild.members.search({ query: q, limit: 10 }).catch(() => null);
+    const members = result
+      ? Array.from(result.values()).map((m) => ({
+          id: m.user.id,
+          name: m.user.globalName || m.user.username,
+          username: m.user.username,
+          avatar: m.user.displayAvatarURL({ size: 64 }),
+        }))
+      : [];
+
+    return ok(res, { members });
   } catch (e) {
-    console.error("[Web] players error:", e);
-    return res.status(500).json({ ok: false, error: "PLAYERS_FAILED" });
+    console.error("[Web] member search error:", e);
+    return err(res, 500, "MEMBER_SEARCH_FAILED");
   }
 });
 
-/** 調整積分：{ userId, delta } */
-app.post("/admin/api/points/adjust", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：讀取某人分數
+ *  GET /admin/api/points/get?userId=xxx
+ * ======================================================================= */
+app.get("/admin/api/points/get", authApi, async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || "");
+    if (!userId) return err(res, 400, "BAD_REQUEST");
+
+    const snap = await pointsRef(userId).get();
+    const points = Number(snap.val() ?? 0);
+    return ok(res, { userId, points });
+  } catch (e) {
+    console.error("[Web] points get error:", e);
+    return err(res, 500, "POINTS_GET_FAILED");
+  }
+});
+
+/* =======================================================================
+ *  API：加減分（transaction 防打架）
+ *  POST /admin/api/points/adjust  { userId, delta }
+ * ======================================================================= */
+app.post("/admin/api/points/adjust", authApi, async (req, res) => {
   try {
     const { userId, delta } = req.body || {};
-    const d = Number(delta || 0);
+    const uid = String(userId || "").trim();
+    const d = Number(delta);
 
-    if (!userId || !Number.isFinite(d)) {
-      return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
-    }
+    if (!uid || !Number.isFinite(d)) return err(res, 400, "BAD_REQUEST");
 
-    if (pointsDb?.addPoints) {
-      const after = await pointsDb.addPoints(userId, d);
-      return jsonOK(res, { after: Number(after || 0) });
-    }
+    const ref = pointsRef(uid);
+    const result = await ref.transaction((cur) => {
+      const curNum = Number(cur ?? 0);
+      return curNum + d;
+    });
 
-    // fallback: 如果沒 addPoints 就試試 setPoints/getPoints
-    if (pointsDb?.getPoints && pointsDb?.setPoints) {
-      const cur = await pointsDb.getPoints(userId);
-      const after = await pointsDb.setPoints(userId, Number(cur || 0) + d);
-      return jsonOK(res, { after: Number(after || 0) });
-    }
+    if (!result.committed) return err(res, 500, "TX_NOT_COMMITTED");
 
-    return jsonOK(res, { after: null });
+    const after = Number(result.snapshot.val() ?? 0);
+    return ok(res, { userId: uid, after });
   } catch (e) {
-    console.error("[Web] adjust error:", e);
-    return res.status(500).json({ ok: false, error: "ADJUST_FAILED" });
+    console.error("[Web] points adjust error:", e);
+    return err(res, 500, "ADJUST_FAILED");
   }
 });
 
-/** 讀房間/遊戲狀態 */
-app.get("/admin/api/rooms", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：排行榜（掃 points/ 取 top N）
+ *  GET /admin/api/leaderboard?top=20
+ * ======================================================================= */
+app.get("/admin/api/leaderboard", authApi, async (req, res) => {
   try {
-    const rooms = roomsDb?.getRooms
-      ? await roomsDb.getRooms()
-      : botState?.getRooms
-      ? botState.getRooms()
-      : [];
-    return jsonOK(res, { rooms });
+    const top = Math.max(1, Math.min(100, Number(req.query?.top || 20)));
+
+    // Realtime DB 沒有很好用的「按 value 排序 + topN」，最簡單是全掃再排序（小量使用 OK）
+    const snap = await getDb().ref("points").get();
+    const obj = snap.val() || {};
+
+    const rows = Object.entries(obj)
+      .map(([userId, points]) => ({ userId, points: Number(points ?? 0) }))
+      .sort((a, b) => b.points - a.points)
+      .slice(0, top);
+
+    return ok(res, { rows });
   } catch (e) {
-    console.error("[Web] rooms error:", e);
-    return res.status(500).json({ ok: false, error: "ROOMS_FAILED" });
+    console.error("[Web] leaderboard error:", e);
+    return err(res, 500, "LEADERBOARD_FAILED");
   }
 });
 
-/** 強制停止房間遊戲：{ roomId, game } */
-app.post("/admin/api/rooms/forceStop", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：解析使用者資訊（給排行榜用）
+ *  POST /admin/api/users/resolve { ids: ["id1","id2"] }
+ * ======================================================================= */
+app.post("/admin/api/users/resolve", authApi, async (req, res) => {
   try {
-    const { roomId, game } = req.body || {};
-    if (!roomId) return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+    const client = runtime.client;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 30) : [];
 
-    if (roomsDb?.forceStop) {
-      const result = await roomsDb.forceStop(roomId, game || "all");
-      return jsonOK(res, { result });
+    if (!client || !ids.length) return ok(res, { users: {} });
+
+    const users = {};
+    for (const id of ids) {
+      const u = await client.users.fetch(id).catch(() => null);
+      if (!u) continue;
+      users[id] = {
+        id: u.id,
+        name: u.globalName || u.username,
+        username: u.username,
+        avatar: u.displayAvatarURL({ size: 64 }),
+      };
     }
 
-    if (botState?.forceStop) {
-      const result = botState.forceStop(roomId, game || "all");
-      return jsonOK(res, { result });
-    }
-
-    return jsonOK(res, { result: null });
+    return ok(res, { users });
   } catch (e) {
-    console.error("[Web] forceStop error:", e);
-    return res.status(500).json({ ok: false, error: "FORCESTOP_FAILED" });
+    console.error("[Web] users resolve error:", e);
+    return err(res, 500, "USERS_RESOLVE_FAILED");
   }
 });
 
-/** 歷史戰績 */
-app.get("/admin/api/history", apiAuth, async (req, res) => {
-  try {
-    const days = Math.max(1, Math.min(365, Number(req.query?.days || 7)));
-    const rows = historyDb?.getRecentRooms ? await historyDb.getRecentRooms(days) : [];
-    return jsonOK(res, { rows });
-  } catch (e) {
-    console.error("[Web] history error:", e);
-    return res.status(500).json({ ok: false, error: "HISTORY_FAILED" });
-  }
-});
-
-/** 讀設定 */
-app.get("/admin/api/settings", apiAuth, async (req, res) => {
+/* =======================================================================
+ *  API：設定（中文表單用）
+ *  GET  /admin/api/settings?guildId=global
+ *  POST /admin/api/settings?guildId=global
+ * ======================================================================= */
+app.get("/admin/api/settings", authApi, async (req, res) => {
   try {
     const guildId = String(req.query?.guildId || "global");
-    const settings = roomsDb?.getSettings
-      ? await roomsDb.getSettings(guildId)
-      : botState?.getSettings
-      ? botState.getSettings()
-      : {};
-    return jsonOK(res, { settings });
+    const snap = await settingsRef(guildId).get();
+    const settings = snap.val() || {};
+    return ok(res, { settings });
   } catch (e) {
-    console.error("[Web] settings error:", e);
-    return res.status(500).json({ ok: false, error: "SETTINGS_FAILED" });
+    console.error("[Web] settings get error:", e);
+    return err(res, 500, "SETTINGS_FAILED");
   }
 });
 
-/** 存設定 */
-app.post("/admin/api/settings", apiAuth, async (req, res) => {
+app.post("/admin/api/settings", authApi, async (req, res) => {
   try {
     const guildId = String(req.query?.guildId || "global");
     const payload = req.body || {};
-
-    if (roomsDb?.setSettings) {
-      await roomsDb.setSettings(guildId, payload);
-      return jsonOK(res, { saved: true });
-    }
-    if (botState?.setSettings) {
-      botState.setSettings(payload);
-      return jsonOK(res, { saved: true });
-    }
-    return jsonOK(res, { saved: false });
+    await settingsRef(guildId).set(payload);
+    return ok(res, { saved: true });
   } catch (e) {
     console.error("[Web] settings save error:", e);
-    return res.status(500).json({ ok: false, error: "SETTINGS_SAVE_FAILED" });
+    return err(res, 500, "SETTINGS_SAVE_FAILED");
   }
 });
 
-/* ================= 404 ================= */
+/* -------------------- 404 -------------------- */
 app.use((req, res) => res.status(404).send("Not Found"));
 
-/* ================= Start ================= */
+/* -------------------- Start -------------------- */
 function startWeb() {
   const PORT = Number(process.env.PORT || 3000);
   app.listen(PORT, () => console.log(`[Web] listening on ${PORT}`));
-  return { app, runtime };
+  return runtime;
 }
 
 module.exports = { startWeb, attachRuntime, app };
 
-/* -------------------- HTML -------------------- */
+/* =======================================================================================
+ *  HTML（中文後台）
+ * ======================================================================================= */
 function loginHtml(showErr) {
-  return `<!DOCTYPE html>
+  return `<!doctype html>
 <html lang="zh-TW">
 <head>
-<meta charset="UTF-8" />
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>管理員登入</title>
 <style>
-:root{ --bg:#0b1020; --card:#111a33; --muted:rgba(255,255,255,.7); --line:rgba(255,255,255,.12); --pri:#7c3aed; --pri2:#22c55e; }
-*{box-sizing:border-box}
-body{
-  margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
-  background: radial-gradient(1200px 500px at 20% 0%, rgba(124,58,237,.35), transparent 60%),
-             radial-gradient(900px 400px at 100% 20%, rgba(34,197,94,.25), transparent 55%),
-             var(--bg);
-  color:white; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans TC";
-}
-.box{
-  width:380px; padding:24px; border-radius:18px;
-  background: rgba(17,26,51,.75);
-  border:1px solid rgba(255,255,255,.10);
-  box-shadow: 0 10px 40px rgba(0,0,0,.35);
-  backdrop-filter: blur(10px);
-}
-h2{margin:0 0 14px 0; font-size:20px;}
-label{display:block; font-size:12px; opacity:.85; margin-top:10px;}
-input{
-  width:100%; padding:12px; margin-top:6px;
-  border-radius:12px; border:1px solid rgba(255,255,255,.12);
-  background: rgba(0,0,0,.25); color:white; outline:none;
-}
-button{
-  width:100%; padding:12px; margin-top:14px;
-  border-radius:12px; border:none; cursor:pointer;
-  background: linear-gradient(90deg, var(--pri), #2563eb);
-  color:white; font-weight:800;
-}
-.err{
-  margin-top:12px; padding:10px; border-radius:12px;
-  background: rgba(239,68,68,.18); border:1px solid rgba(239,68,68,.35);
-  color: #fecaca; font-size:13px;
-}
-.small{margin-top:12px; color:var(--muted); font-size:12px;}
+  :root{--bg:#0b1220;--card:rgba(255,255,255,.06);--card2:rgba(255,255,255,.08);--text:#e5e7eb;--muted:#9ca3af;--pri:#38bdf8;--bad:#ef4444;}
+  *{box-sizing:border-box}
+  body{margin:0;height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 500px at 20% 10%, rgba(56,189,248,.25), transparent), var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC";}
+  .box{width:min(420px,92vw);background:var(--card);border:1px solid rgba(255,255,255,.10);border-radius:18px;padding:22px;backdrop-filter:blur(10px)}
+  h1{margin:0 0 10px;font-size:18px}
+  .muted{color:var(--muted);font-size:12px;margin-bottom:14px}
+  input,button{width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.05);color:var(--text);outline:none}
+  input{margin:8px 0}
+  button{margin-top:10px;background:linear-gradient(90deg, rgba(56,189,248,.9), rgba(99,102,241,.9));border:none;font-weight:700;cursor:pointer}
+  .err{margin-top:12px;background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.4);padding:10px;border-radius:12px;color:#fecaca}
 </style>
 </head>
 <body>
   <form class="box" method="POST" action="/admin/login">
-    <h2>管理員登入</h2>
-    <label>帳號</label>
-    <input name="user" placeholder="Admin user" required />
-    <label>密碼</label>
-    <input name="pass" type="password" placeholder="Admin password" required />
+    <h1>機器人管理後台</h1>
+    <div class="muted">請輸入管理員帳密</div>
+    <input name="user" placeholder="帳號" required />
+    <input name="pass" type="password" placeholder="密碼" required />
     <button type="submit">登入</button>
-    ${showErr ? `<div class="err">帳密錯誤</div>` : ""}
-    <div class="small">需要 ENV：JWT_SECRET / ADMIN_USER / ADMIN_PASS</div>
+    ${showErr ? `<div class="err">帳號或密碼錯誤</div>` : ``}
   </form>
 </body>
 </html>`;
 }
 
 function adminHtml() {
-  return `<!DOCTYPE html>
+  // 預設設定（表單會讀取 /admin/api/settings）
+  const defaultSettings = {
+    // 你可以把遊戲設定都放這裡，bot 端自己去讀 settings/global 或 settings/{guildId}
+    gameEnabled: true,
+    pointsEnabled: true,
+    cooldownSec: 2,
+  };
+
+  return `<!doctype html>
 <html lang="zh-TW">
 <head>
-<meta charset="UTF-8" />
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Bot Admin</title>
+<title>中文管理後台</title>
 <style>
-:root{
-  --bg:#0b1020;
-  --panel:#0f1730;
-  --card:#111a33;
-  --line:rgba(255,255,255,.10);
-  --muted:rgba(255,255,255,.70);
-  --text:#fff;
-  --pri:#7c3aed;
-  --ok:#22c55e;
-  --warn:#f59e0b;
-  --bad:#ef4444;
-}
-*{box-sizing:border-box}
-body{
-  margin:0; min-height:100vh;
-  background: radial-gradient(1200px 500px at 20% 0%, rgba(124,58,237,.25), transparent 60%),
-             radial-gradient(900px 400px at 100% 30%, rgba(34,197,94,.18), transparent 55%),
-             var(--bg);
-  color:var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans TC";
-}
-a{color:#93c5fd; text-decoration:none}
-a:hover{text-decoration:underline}
-.layout{display:flex; min-height:100vh;}
-.sidebar{
-  width:260px; padding:18px;
-  background: rgba(15,23,48,.75);
-  border-right:1px solid var(--line);
-  backdrop-filter: blur(10px);
-}
-.brand{display:flex; align-items:center; gap:10px; margin-bottom:16px;}
-.logo{
-  width:38px; height:38px; border-radius:12px;
-  background: linear-gradient(135deg, var(--pri), #2563eb);
-  box-shadow: 0 8px 30px rgba(124,58,237,.35);
-}
-.brand h1{font-size:16px; margin:0;}
-.brand .sub{font-size:12px; color:var(--muted); margin-top:2px}
-.nav{margin-top:14px; display:flex; flex-direction:column; gap:8px;}
-.nav button{
-  width:100%; text-align:left; padding:10px 12px;
-  border-radius:12px; border:1px solid rgba(255,255,255,.06);
-  background: rgba(17,26,51,.45);
-  color:#fff; cursor:pointer; font-weight:700;
-}
-.nav button.active{
-  background: rgba(124,58,237,.22);
-  border-color: rgba(124,58,237,.35);
-}
-.meta{
-  margin-top:14px; padding:12px; border-radius:14px;
-  background: rgba(17,26,51,.45);
-  border:1px solid rgba(255,255,255,.06);
-  color:var(--muted); font-size:12px;
-}
-.main{flex:1; padding:22px;}
-.topbar{
-  display:flex; justify-content:space-between; align-items:center; gap:12px;
-  margin-bottom:14px;
-}
-.title{font-size:18px; font-weight:900; margin:0;}
-.pill{
-  display:inline-flex; align-items:center; gap:8px;
-  padding:8px 12px; border-radius:999px;
-  background: rgba(17,26,51,.55); border:1px solid rgba(255,255,255,.06);
-  color:var(--muted); font-size:12px;
-}
-.grid{display:grid; gap:12px;}
-.card{
-  background: rgba(17,26,51,.60);
-  border:1px solid rgba(255,255,255,.08);
-  border-radius:18px;
-  padding:14px;
-  box-shadow: 0 10px 40px rgba(0,0,0,.25);
-  backdrop-filter: blur(10px);
-}
-.card h3{margin:0 0 10px 0; font-size:14px;}
-.row{display:flex; gap:10px; flex-wrap:wrap;}
-input,select,textarea{
-  padding:10px 12px; border-radius:12px;
-  border:1px solid rgba(255,255,255,.10);
-  background: rgba(0,0,0,.25); color:#fff; outline:none;
-}
-textarea{width:100%; min-height:180px; resize:vertical;}
-.btn{
-  padding:10px 12px; border-radius:12px; border:none;
-  cursor:pointer; font-weight:900; color:#fff;
-  background: linear-gradient(90deg, var(--pri), #2563eb);
-}
-.btn.ghost{
-  background: rgba(255,255,255,.06);
-  border:1px solid rgba(255,255,255,.10);
-  font-weight:800;
-}
-.small{font-size:12px; color:var(--muted);}
-.table{width:100%; border-collapse:collapse; font-size:13px;}
-.table th,.table td{padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; vertical-align:middle;}
-.user{
-  display:flex; align-items:center; gap:10px;
-}
-.avatar{
-  width:34px; height:34px; border-radius:12px; overflow:hidden;
-  background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08);
-  flex:0 0 auto;
-}
-.avatar img{width:100%; height:100%; object-fit:cover}
-.name{font-weight:900; line-height:1.1}
-.uid{font-size:11px; color:var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;}
-.badge{
-  display:inline-flex; align-items:center; gap:6px;
-  padding:6px 10px; border-radius:999px;
-  border:1px solid rgba(255,255,255,.10);
-  background: rgba(255,255,255,.05);
-  font-size:12px; color:var(--muted);
-}
-.hidden{display:none}
+  :root{
+    --bg:#0b1220;
+    --panel:rgba(255,255,255,.06);
+    --panel2:rgba(255,255,255,.08);
+    --border:rgba(255,255,255,.10);
+    --text:#e5e7eb;
+    --muted:#9ca3af;
+    --pri:#38bdf8;
+    --pri2:#6366f1;
+    --bad:#ef4444;
+    --ok:#22c55e;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:radial-gradient(1200px 600px at 15% 0%, rgba(56,189,248,.18), transparent),
+               radial-gradient(900px 500px at 90% 30%, rgba(99,102,241,.18), transparent),
+               var(--bg);
+    color:var(--text);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC";
+  }
+  a{color:var(--pri)}
+  .layout{display:grid;grid-template-columns:280px 1fr;min-height:100vh}
+  .side{
+    padding:18px;
+    border-right:1px solid var(--border);
+    background:rgba(0,0,0,.18);
+    backdrop-filter:blur(10px);
+  }
+  .brand{
+    display:flex;gap:10px;align-items:center;
+    padding:12px 12px;
+    border:1px solid var(--border);
+    background:var(--panel);
+    border-radius:16px;
+  }
+  .dot{
+    width:14px;height:14px;border-radius:999px;
+    background:linear-gradient(180deg,var(--pri),var(--pri2));
+    box-shadow:0 0 22px rgba(56,189,248,.35);
+  }
+  .brand h1{font-size:14px;margin:0}
+  .brand .muted{font-size:12px;color:var(--muted)}
+  .nav{margin-top:14px;display:flex;flex-direction:column;gap:8px}
+  .nav button{
+    width:100%;
+    text-align:left;
+    padding:12px 12px;
+    border-radius:14px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.04);
+    color:var(--text);
+    cursor:pointer;
+    font-weight:650;
+  }
+  .nav button.active{
+    background:linear-gradient(90deg, rgba(56,189,248,.22), rgba(99,102,241,.18));
+    border-color:rgba(56,189,248,.35);
+  }
+  .main{padding:18px 18px 50px}
+  .topbar{
+    display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;
+    padding:14px;
+    border:1px solid var(--border);
+    background:var(--panel);
+    border-radius:18px;
+  }
+  .pill{
+    display:flex;align-items:center;gap:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.04);
+    padding:10px 12px;
+    border-radius:999px;
+  }
+  .pill img{width:28px;height:28px;border-radius:8px;object-fit:cover}
+  select,input,textarea{
+    border-radius:12px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.05);
+    color:var(--text);
+    padding:10px 12px;
+    outline:none;
+  }
+  textarea{width:100%;min-height:140px;resize:vertical}
+  .btn{
+    border:none;
+    background:linear-gradient(90deg, rgba(56,189,248,.9), rgba(99,102,241,.9));
+    color:#07101f;
+    font-weight:800;
+    padding:10px 12px;
+    border-radius:12px;
+    cursor:pointer;
+  }
+  .btn.ghost{
+    background:rgba(255,255,255,.06);
+    color:var(--text);
+    border:1px solid var(--border);
+    font-weight:700;
+  }
+  .grid{margin-top:14px;display:grid;grid-template-columns:1fr;gap:12px}
+  .card{
+    border:1px solid var(--border);
+    background:var(--panel);
+    border-radius:18px;
+    padding:14px;
+  }
+  .card h2{margin:0 0 10px;font-size:16px}
+  .muted{color:var(--muted);font-size:12px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid rgba(255,255,255,.10);padding:10px;text-align:left;vertical-align:middle}
+  th{color:#cbd5e1;font-size:12px}
+  .u{display:flex;gap:10px;align-items:center}
+  .u img{width:34px;height:34px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,.06)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono";font-size:12px}
+  .tag{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.04);font-size:12px;color:#cbd5e1}
+  .deltaBtns button{
+    padding:8px 10px;border-radius:12px;border:1px solid var(--border);
+    background:rgba(255,255,255,.05);color:var(--text);cursor:pointer;font-weight:700
+  }
+  .deltaBtns button.plus{border-color:rgba(34,197,94,.35)}
+  .deltaBtns button.minus{border-color:rgba(239,68,68,.35)}
+  .notice{padding:10px;border-radius:14px;border:1px solid rgba(56,189,248,.25);background:rgba(56,189,248,.08)}
+  @media (max-width: 900px){
+    .layout{grid-template-columns:1fr}
+    .side{position:sticky;top:0;z-index:2}
+  }
 </style>
 </head>
 <body>
 <div class="layout">
-  <aside class="sidebar">
+  <aside class="side">
     <div class="brand">
-      <div class="logo"></div>
+      <div class="dot"></div>
       <div>
-        <h1>Bot Admin</h1>
-        <div class="sub">Sidebar UI • Avatars • API Tools</div>
+        <h1>中文管理後台</h1>
+        <div class="muted">使用者：${escapeHtml(ADMIN_USER || "admin")}</div>
       </div>
     </div>
 
     <div class="nav">
-      <button class="active" data-view="dash">Dashboard</button>
-      <button data-view="leaderboard">Leaderboard</button>
-      <button data-view="players">Players</button>
-      <button data-view="rooms">Rooms</button>
-      <button data-view="history">History</button>
-      <button data-view="settings">Settings</button>
+      <button class="active" data-page="dash">🏠 儀表板</button>
+      <button data-page="players">👤 玩家查找 / 加減分</button>
+      <button data-page="lb">🏆 排行榜</button>
+      <button data-page="settings">⚙️ 設定</button>
+      <button onclick="location.href='/admin/logout'" class="ghost">🚪 登出</button>
     </div>
 
-    <div class="meta">
-      👤 管理員： <b>${ADMIN_USER}</b><br/>
-      <span class="small">登入狀態有效 12 小時</span><br/>
-      <a href="/admin/logout">登出</a>
+    <div style="margin-top:14px" class="card">
+      <div class="muted">提示</div>
+      <div style="margin-top:6px" class="muted">
+        玩家這頁是「搜尋」模式，不會列整個伺服器成員。
+      </div>
     </div>
   </aside>
 
   <main class="main">
     <div class="topbar">
-      <h2 id="pageTitle" class="title">Dashboard</h2>
       <div class="pill">
-        <span class="badge">✅ Web OK</span>
-        <span class="badge" id="discordBadge">⏳ Discord unknown</span>
+        <img id="guildIcon" alt="" />
+        <div>
+          <div style="font-weight:800">目前伺服器</div>
+          <div class="muted" id="guildName">（讀取中...）</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <select id="guildSelect"></select>
+        <button class="btn ghost" onclick="reloadAll()">重新載入</button>
       </div>
     </div>
 
-    <!-- Dashboard -->
-    <section id="view-dash" class="grid">
+    <section id="page_dash" class="grid">
       <div class="card">
-        <h3>快速操作</h3>
-        <div class="row">
-          <button class="btn" onclick="refreshAll()">全部重新整理</button>
-          <button class="btn ghost" onclick="openView('leaderboard')">看排行榜</button>
-          <button class="btn ghost" onclick="openView('players')">看玩家</button>
-        </div>
-        <div class="small" style="margin-top:10px;">
-          如果你看到「載入失敗」，通常是 Firebase/points list API 沒做好，或沒 attachRuntime 導致抓不到 Discord 頭像。
+        <h2>狀態</h2>
+        <div class="notice">
+          ✅ 後台已啟動<br/>
+          <span class="muted">如果你機器人回覆慢，通常是 Firebase 認證或指令內部寫法造成，後台本身不應該慢。</span>
         </div>
       </div>
 
       <div class="card">
-        <h3>摘要</h3>
+        <h2>快速操作</h2>
         <div class="row">
-          <div class="badge" id="sumPlayers">Players: -</div>
-          <div class="badge" id="sumTop1">Top1: -</div>
+          <button class="btn" onclick="go('players')">去玩家查找</button>
+          <button class="btn ghost" onclick="go('lb')">看排行榜</button>
+          <button class="btn ghost" onclick="go('settings')">改設定</button>
         </div>
       </div>
     </section>
 
-    <!-- Leaderboard -->
-    <section id="view-leaderboard" class="grid hidden">
+    <section id="page_players" class="grid" style="display:none">
       <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3 style="margin:0">排行榜</h3>
-          <div class="row">
-            <select id="lbTop">
-              <option value="20">Top 20</option>
-              <option value="50">Top 50</option>
-              <option value="100">Top 100</option>
-            </select>
-            <button class="btn" onclick="loadLeaderboard()">重新載入</button>
+        <h2>搜尋玩家（不列全員）</h2>
+        <div class="muted">輸入至少 2 個字，例如：暱稱、使用者名稱的一部分</div>
+        <div class="row" style="margin-top:10px">
+          <input id="q" placeholder="輸入玩家名稱..." style="flex:1;min-width:220px" />
+          <button class="btn" onclick="searchMember()">搜尋</button>
+        </div>
+        <div id="searchResult" style="margin-top:12px" class="muted">（尚未搜尋）</div>
+      </div>
+
+      <div class="card" id="playerCard" style="display:none">
+        <h2>玩家分數管理</h2>
+        <div class="row" style="justify-content:space-between">
+          <div class="u">
+            <img id="pAvatar" alt="" />
+            <div>
+              <div style="font-weight:900" id="pName">-</div>
+              <div class="muted mono" id="pId">-</div>
+            </div>
+          </div>
+          <div class="tag">目前分數：<span class="mono" id="pPoints">0</span></div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div class="deltaBtns row">
+            <button class="plus" onclick="adjust(+1)">+1</button>
+            <button class="plus" onclick="adjust(+5)">+5</button>
+            <button class="plus" onclick="adjust(+10)">+10</button>
+            <button class="minus" onclick="adjust(-1)">-1</button>
+            <button class="minus" onclick="adjust(-5)">-5</button>
+            <button class="minus" onclick="adjust(-10)">-10</button>
+          </div>
+          <div class="row" style="margin-left:auto">
+            <input id="customDelta" placeholder="自訂（例如 25 或 -40）" style="width:220px" />
+            <button class="btn ghost" onclick="adjustCustom()">套用</button>
           </div>
         </div>
-        <div id="lbBox" class="small" style="margin-top:10px;">載入中...</div>
+
+        <div class="muted" style="margin-top:10px">加減分會即時寫入 Firebase（transaction 防打架）。</div>
       </div>
     </section>
 
-    <!-- Players -->
-    <section id="view-players" class="grid hidden">
+    <section id="page_lb" class="grid" style="display:none">
       <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3 style="margin:0">玩家清單</h3>
-          <button class="btn" onclick="loadPlayers()">重新載入</button>
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <h2>排行榜</h2>
+            <div class="muted">顯示頭像與姓名（抓不到時會顯示 ID）</div>
+          </div>
+          <button class="btn" onclick="loadLeaderboard()">重新載入</button>
         </div>
-        <div id="playersBox" class="small" style="margin-top:10px;">載入中...</div>
-      </div>
-
-      <div class="card">
-        <h3>調整積分</h3>
-        <div class="row">
-          <input id="uid" placeholder="userId（Discord ID）" style="flex:1;min-width:260px">
-          <input id="delta" placeholder="delta（例如 10 或 -5）" style="width:220px">
-          <button class="btn" onclick="adjust()">送出</button>
-        </div>
-        <div class="small" style="margin-top:10px;">建議：先從 Players 表格複製 userId</div>
+        <div id="lbBox" class="muted" style="margin-top:10px">載入中...</div>
       </div>
     </section>
 
-    <!-- Rooms -->
-    <section id="view-rooms" class="grid hidden">
+    <section id="page_settings" class="grid" style="display:none">
       <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3 style="margin:0">房間狀態</h3>
-          <button class="btn" onclick="loadRooms()">重新載入</button>
-        </div>
-        <div id="roomsBox" class="small" style="margin-top:10px;">載入中...</div>
-      </div>
-    </section>
+        <h2>設定（中文表單）</h2>
+        <div class="muted">這裡是「後台存設定」，你的 bot 需要自己去讀 settings/{guildId} 或 settings/global 才會生效。</div>
 
-    <!-- History -->
-    <section id="view-history" class="grid hidden">
-      <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3 style="margin:0">歷史紀錄</h3>
-          <div class="row">
-            <select id="hisDays">
-              <option value="7">7 天</option>
-              <option value="30">30 天</option>
-              <option value="90">90 天</option>
+        <div style="margin-top:12px" class="row">
+          <div style="flex:1;min-width:250px">
+            <div class="muted">是否啟用遊戲</div>
+            <select id="set_gameEnabled" style="width:100%">
+              <option value="true">啟用</option>
+              <option value="false">停用</option>
             </select>
-            <button class="btn" onclick="loadHistory()">重新載入</button>
+          </div>
+          <div style="flex:1;min-width:250px">
+            <div class="muted">是否啟用積分</div>
+            <select id="set_pointsEnabled" style="width:100%">
+              <option value="true">啟用</option>
+              <option value="false">停用</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:250px">
+            <div class="muted">冷卻秒數（避免洗頻）</div>
+            <input id="set_cooldownSec" type="number" min="0" step="1" style="width:100%" />
           </div>
         </div>
-        <div id="historyBox" class="small" style="margin-top:10px;">載入中...</div>
-      </div>
-    </section>
 
-    <!-- Settings -->
-    <section id="view-settings" class="grid hidden">
-      <div class="card">
-        <h3>Settings</h3>
-        <div class="row" style="align-items:center">
-          <input id="gid" value="global" style="width:240px" />
-          <button class="btn" onclick="loadSettings()">讀取</button>
-          <button class="btn ghost" onclick="saveSettings()">儲存</button>
+        <div class="row" style="margin-top:12px;justify-content:flex-end">
+          <button class="btn ghost" onclick="loadSettings()">讀取</button>
+          <button class="btn" onclick="saveSettings()">儲存</button>
         </div>
-        <div class="small" style="margin-top:10px;">JSON：</div>
-        <textarea id="settingsBox"></textarea>
+
+        <div class="muted" id="setStatus" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -734,189 +703,266 @@ textarea{width:100%; min-height:180px; resize:vertical;}
 </div>
 
 <script>
-const views = ["dash","leaderboard","players","rooms","history","settings"];
+  const DEFAULT_SETTINGS = ${JSON.stringify(defaultSettings)};
 
-function openView(name){
-  document.getElementById("pageTitle").textContent = name.charAt(0).toUpperCase() + name.slice(1);
-  for(const v of views){
-    document.getElementById("view-"+v).classList.toggle("hidden", v!==name);
-  }
-  document.querySelectorAll(".nav button").forEach(b=>{
-    b.classList.toggle("active", b.dataset.view===name);
-  });
-}
+  let currentGuildId = "global";
+  let selectedUserId = null;
+  let selectedUserInfo = null;
 
-document.querySelectorAll(".nav button").forEach(b=>{
-  b.addEventListener("click", ()=>openView(b.dataset.view));
-});
+  function esc(s){ return String(s||"").replace(/[&<>"']/g, (c)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 
-async function api(url, opts){
-  const res = await fetch(url, { headers: {"Content-Type":"application/json"}, ...opts });
-  const json = await res.json().catch(()=>null);
-  if(!res.ok || !json || json.ok === false){
-    throw new Error((json && json.error) || ("HTTP_"+res.status));
-  }
-  return json;
-}
-
-function userCell(r){
-  const avatar = r.avatar ? '<img src="'+r.avatar+'" />' : "";
-  const name = (r.name || "Unknown");
-  const uid = r.userId || "";
-  return '<div class="user"><div class="avatar">'+avatar+'</div><div><div class="name">'+escapeHtml(name)+'</div><div class="uid">'+escapeHtml(uid)+'</div></div></div>';
-}
-
-function escapeHtml(s){
-  return String(s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-}
-
-function table(headers, rows, renderRow){
-  if(!rows || !rows.length) return '<div class="small">（沒有資料）</div>';
-  let h = '<table class="table"><thead><tr>' + headers.map(x=>'<th>'+x+'</th>').join('') + '</tr></thead><tbody>';
-  h += rows.map(renderRow).join('');
-  h += '</tbody></table>';
-  return h;
-}
-
-async function loadLeaderboard(){
-  const box = document.getElementById("lbBox");
-  box.textContent = "載入中...";
-  try{
-    const top = document.getElementById("lbTop").value || "20";
-    const j = await api("/admin/api/leaderboard?top="+encodeURIComponent(top));
-    const rows = j.rows || [];
-    box.innerHTML = table(["玩家","分數"], rows, r => '<tr><td>'+userCell(r)+'</td><td><b>'+Number(r.points||0)+'</b></td></tr>');
-
-    // summary
-    if(rows.length){
-      document.getElementById("sumTop1").textContent = "Top1: " + (rows[0].name || rows[0].userId) + " ("+rows[0].points+")";
+  async function api(url, opts){
+    const res = await fetch(url, { headers: { "Content-Type":"application/json" }, ...opts });
+    const json = await res.json().catch(()=>null);
+    if(!res.ok || !json || json.ok === false){
+      throw new Error((json && json.error) || ("HTTP_"+res.status));
     }
-  }catch(e){
-    box.textContent = "載入失敗：" + e.message;
+    return json;
   }
-}
 
-async function loadPlayers(){
-  const box = document.getElementById("playersBox");
-  box.textContent = "載入中...";
-  try{
-    const j = await api("/admin/api/players");
-    const rows = j.rows || [];
-    document.getElementById("sumPlayers").textContent = "Players: " + rows.length;
-
-    box.innerHTML = table(["玩家","分數"], rows, r => {
-      return '<tr><td>'+userCell(r)+'</td><td><b>'+Number(r.points||0)+'</b></td></tr>';
+  function go(page){
+    document.querySelectorAll(".nav button[data-page]").forEach(b=>{
+      b.classList.toggle("active", b.dataset.page === page);
     });
-  }catch(e){
-    box.textContent = "載入失敗：" + e.message;
-  }
-}
 
-async function adjust(){
-  const uid = document.getElementById("uid").value.trim();
-  const delta = document.getElementById("delta").value.trim();
-  if(!uid) return alert("請填 userId");
-  if(!delta) return alert("請填 delta");
-  try{
-    const j = await api("/admin/api/points/adjust", { method:"POST", body: JSON.stringify({userId: uid, delta}) });
-    alert("完成！最新分數：" + j.after);
-    loadLeaderboard();
-    loadPlayers();
-  }catch(e){
-    alert("失敗：" + e.message);
-  }
-}
-
-async function loadRooms(){
-  const box = document.getElementById("roomsBox");
-  box.textContent = "載入中...";
-  try{
-    const j = await api("/admin/api/rooms");
-    const rows = j.rooms || [];
-    box.innerHTML = table(["roomId","status","game","updatedAt"], rows, r => {
-      return '<tr>'
-        +'<td class="uid">'+escapeHtml(r.roomId||"")+'</td>'
-        +'<td>'+escapeHtml(r.status||"")+'</td>'
-        +'<td>'+escapeHtml(r.game||"")+'</td>'
-        +'<td>'+escapeHtml(r.updatedAt||"")+'</td>'
-      +'</tr>';
+    ["dash","players","lb","settings"].forEach(p=>{
+      const el = document.getElementById("page_"+p);
+      if(!el) return;
+      el.style.display = (p===page) ? "" : "none";
     });
-  }catch(e){
-    box.textContent = "載入失敗：" + e.message;
   }
-}
 
-async function loadHistory(){
-  const box = document.getElementById("historyBox");
-  box.textContent = "載入中...";
-  try{
-    const days = document.getElementById("hisDays").value || "7";
-    const j = await api("/admin/api/history?days="+encodeURIComponent(days));
-    const rows = j.rows || [];
-    box.innerHTML = table(["id","roomId","game","winner","createdAt"], rows, r => {
-      return '<tr>'
-        +'<td class="uid">'+escapeHtml(r.id||"")+'</td>'
-        +'<td class="uid">'+escapeHtml(r.roomId||"")+'</td>'
-        +'<td>'+escapeHtml(r.game||"")+'</td>'
-        +'<td>'+escapeHtml(r.winner||"")+'</td>'
-        +'<td>'+escapeHtml(r.createdAt||"")+'</td>'
-      +'</tr>';
-    });
-  }catch(e){
-    box.textContent = "載入失敗：" + e.message;
+  document.querySelectorAll(".nav button[data-page]").forEach(b=>{
+    b.addEventListener("click", ()=>go(b.dataset.page));
+  });
+
+  async function initGuilds(){
+    const j = await api("/admin/api/guilds");
+    const guilds = j.guilds || [];
+    const sel = document.getElementById("guildSelect");
+    sel.innerHTML = "";
+
+    // 允許 global
+    const opt0 = document.createElement("option");
+    opt0.value = "global";
+    opt0.textContent = "（全域 / global）";
+    sel.appendChild(opt0);
+
+    for(const g of guilds){
+      const opt = document.createElement("option");
+      opt.value = g.id;
+      opt.textContent = g.name;
+      opt.dataset.icon = g.icon || "";
+      sel.appendChild(opt);
+    }
+
+    sel.value = currentGuildId;
+    sel.onchange = ()=>{
+      currentGuildId = sel.value;
+      refreshGuildPill();
+      // 切伺服器時，清掉玩家選取
+      clearSelectedUser();
+      loadSettings();
+    };
+
+    refreshGuildPill();
   }
-}
 
-async function loadSettings(){
-  const gid = (document.getElementById("gid").value.trim() || "global");
-  const box = document.getElementById("settingsBox");
-  box.value = "";
-  try{
-    const j = await api("/admin/api/settings?guildId="+encodeURIComponent(gid));
-    box.value = JSON.stringify(j.settings || {}, null, 2);
-  }catch(e){
-    box.value = "讀取失敗：" + e.message;
+  function refreshGuildPill(){
+    const sel = document.getElementById("guildSelect");
+    const nameEl = document.getElementById("guildName");
+    const iconEl = document.getElementById("guildIcon");
+    const opt = sel.options[sel.selectedIndex];
+    if(!opt) return;
+
+    nameEl.textContent = opt.textContent;
+    const icon = opt.dataset.icon || "";
+    if(icon){
+      iconEl.src = icon;
+      iconEl.style.display = "";
+    }else{
+      iconEl.removeAttribute("src");
+      iconEl.style.display = "none";
+    }
   }
-}
 
-async function saveSettings(){
-  const gid = (document.getElementById("gid").value.trim() || "global");
-  const box = document.getElementById("settingsBox");
-  let obj = {};
-  try{ obj = JSON.parse(box.value || "{}"); }
-  catch{ return alert("JSON 格式錯誤，不能儲存"); }
-
-  try{
-    await api("/admin/api/settings?guildId="+encodeURIComponent(gid), { method:"POST", body: JSON.stringify(obj) });
-    alert("已儲存");
-  }catch(e){
-    alert("儲存失敗：" + e.message);
+  function clearSelectedUser(){
+    selectedUserId = null;
+    selectedUserInfo = null;
+    document.getElementById("playerCard").style.display = "none";
+    document.getElementById("searchResult").textContent = "（尚未搜尋）";
   }
-}
 
-function refreshAll(){
-  loadLeaderboard();
-  loadPlayers();
-  loadRooms();
-  loadHistory();
-  loadSettings();
-}
+  async function searchMember(){
+    const q = document.getElementById("q").value.trim();
+    const out = document.getElementById("searchResult");
+    out.textContent = "搜尋中...";
 
-// Discord badge（僅顯示 UI，真正是否 ready 取決於你有沒有 attachRuntime(client)）
-setInterval(()=>{
-  const b = document.getElementById("discordBadge");
-  // 這裡不直接打後端，避免多餘 API；你想更精準可做 /admin/api/runtime
-  b.textContent = "✅ Discord connected (if attachRuntime ok)";
-}, 3000);
+    if(currentGuildId === "global"){
+      out.textContent = "請先選擇一個伺服器（global 無法搜尋成員）";
+      return;
+    }
+    if(q.length < 2){
+      out.textContent = "請輸入至少 2 個字再搜尋";
+      return;
+    }
 
-// initial load
-loadLeaderboard();
-loadPlayers();
-loadRooms();
-loadHistory();
-loadSettings();
+    try{
+      const j = await api("/admin/api/member/search?guildId="+encodeURIComponent(currentGuildId)+"&q="+encodeURIComponent(q));
+      const members = j.members || [];
+      if(!members.length){
+        out.textContent = "找不到符合的人（換個關鍵字試試）";
+        return;
+      }
+
+      // 顯示成「搜尋結果」，不是全員列表（只顯示 1~10 筆）
+      out.innerHTML =
+        '<div class="muted" style="margin-bottom:8px">搜尋結果（點選一個人管理分數）</div>' +
+        members.map(m=>(
+          '<div class="row" style="padding:10px;border:1px solid rgba(255,255,255,.10);border-radius:14px;margin:8px 0;cursor:pointer" onclick="pickUser(\\''+esc(m.id)+'\\',\\''+esc(m.name)+'\\',\\''+esc(m.avatar)+'\\',\\''+esc(m.username)+'\\')">' +
+            '<div class="u"><img src="'+esc(m.avatar)+'"/><div>' +
+              '<div style="font-weight:900">'+esc(m.name)+'</div>' +
+              '<div class="muted mono">@'+esc(m.username)+' · '+esc(m.id)+'</div>' +
+            '</div></div>' +
+          '</div>'
+        )).join("");
+    }catch(e){
+      out.textContent = "搜尋失敗：" + e.message;
+    }
+  }
+
+  async function pickUser(id, name, avatar, username){
+    selectedUserId = id;
+    selectedUserInfo = { id, name, avatar, username };
+
+    document.getElementById("pAvatar").src = avatar;
+    document.getElementById("pName").textContent = name;
+    document.getElementById("pId").textContent = id;
+
+    document.getElementById("playerCard").style.display = "";
+    await refreshPoints();
+  }
+
+  async function refreshPoints(){
+    if(!selectedUserId) return;
+    const j = await api("/admin/api/points/get?userId="+encodeURIComponent(selectedUserId));
+    document.getElementById("pPoints").textContent = String(j.points ?? 0);
+  }
+
+  async function adjust(delta){
+    if(!selectedUserId) return alert("請先選擇一位玩家");
+    try{
+      const j = await api("/admin/api/points/adjust", {
+        method:"POST",
+        body: JSON.stringify({ userId: selectedUserId, delta })
+      });
+      document.getElementById("pPoints").textContent = String(j.after ?? 0);
+    }catch(e){
+      alert("加減分失敗：" + e.message);
+    }
+  }
+
+  async function adjustCustom(){
+    const v = document.getElementById("customDelta").value.trim();
+    const n = Number(v);
+    if(!Number.isFinite(n)) return alert("自訂數值格式錯誤");
+    await adjust(n);
+  }
+
+  async function loadLeaderboard(){
+    const box = document.getElementById("lbBox");
+    box.textContent = "載入中...";
+    try{
+      const j = await api("/admin/api/leaderboard?top=20");
+      const rows = j.rows || [];
+      if(!rows.length){
+        box.innerHTML = "<div class='muted'>（目前沒有任何分數資料）</div>";
+        return;
+      }
+
+      // 先做 resolve（把 userId 轉成名字與頭像）
+      const ids = rows.map(r=>r.userId);
+      const rr = await api("/admin/api/users/resolve", { method:"POST", body: JSON.stringify({ ids }) });
+      const users = rr.users || {};
+
+      let html = "<table><thead><tr><th>#</th><th>玩家</th><th>分數</th></tr></thead><tbody>";
+      rows.forEach((r,i)=>{
+        const u = users[r.userId];
+        const name = u ? u.name : r.userId;
+        const avatar = u ? u.avatar : "";
+        html += "<tr>";
+        html += "<td class='mono'>"+(i+1)+"</td>";
+        html += "<td>";
+        html += "<div class='u'>";
+        html += avatar ? "<img src='"+esc(avatar)+"'/>" : "<img/>";
+        html += "<div><div style='font-weight:900'>"+esc(name)+"</div>";
+        html += "<div class='muted mono'>"+esc(r.userId)+"</div></div>";
+        html += "</div>";
+        html += "</td>";
+        html += "<td class='mono'>"+esc(r.points)+"</td>";
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      box.innerHTML = html;
+    }catch(e){
+      box.textContent = "載入失敗：" + e.message;
+    }
+  }
+
+  async function loadSettings(){
+    const status = document.getElementById("setStatus");
+    status.textContent = "讀取中...";
+    try{
+      const j = await api("/admin/api/settings?guildId="+encodeURIComponent(currentGuildId));
+      const s = Object.assign({}, DEFAULT_SETTINGS, j.settings || {});
+      document.getElementById("set_gameEnabled").value = String(Boolean(s.gameEnabled));
+      document.getElementById("set_pointsEnabled").value = String(Boolean(s.pointsEnabled));
+      document.getElementById("set_cooldownSec").value = Number(s.cooldownSec ?? 0);
+      status.textContent = "已讀取 ✅";
+    }catch(e){
+      status.textContent = "讀取失敗：" + e.message;
+    }
+  }
+
+  async function saveSettings(){
+    const status = document.getElementById("setStatus");
+    status.textContent = "儲存中...";
+    try{
+      const payload = {
+        gameEnabled: document.getElementById("set_gameEnabled").value === "true",
+        pointsEnabled: document.getElementById("set_pointsEnabled").value === "true",
+        cooldownSec: Number(document.getElementById("set_cooldownSec").value || 0),
+      };
+      await api("/admin/api/settings?guildId="+encodeURIComponent(currentGuildId), {
+        method:"POST",
+        body: JSON.stringify(payload)
+      });
+      status.textContent = "已儲存 ✅（bot 端需要自己去讀設定才會生效）";
+    }catch(e){
+      status.textContent = "儲存失敗：" + e.message;
+    }
+  }
+
+  async function reloadAll(){
+    await initGuilds();
+    await loadSettings();
+    // 不自動刷新玩家，避免誤刷
+    // 排行榜留在使用者點才載入
+  }
+
+  // init
+  (async ()=>{
+    await initGuilds();
+    await loadSettings();
+    go("dash");
+  })();
 </script>
-
 </body>
 </html>`;
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) => {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
 }
