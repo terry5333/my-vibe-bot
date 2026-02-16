@@ -1,14 +1,16 @@
+"use strict";
+
 const path = require("path");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 
-/* -------------------- Safe require (避免路徑沒對就整個炸) -------------------- */
+/* -------------------- Safe require -------------------- */
 function safeRequire(p) {
   try {
     // eslint-disable-next-line import/no-dynamic-require, global-require
     return require(p);
-  } catch (e) {
+  } catch {
     console.warn(`[Web] ⚠️ 找不到模組：${p}（先用空功能代替）`);
     return null;
   }
@@ -32,6 +34,26 @@ const { JWT_SECRET, ADMIN_USER, ADMIN_PASS } = process.env;
 
 if (!JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) {
   console.error("❌ 缺少 ENV：JWT_SECRET / ADMIN_USER / ADMIN_PASS");
+}
+
+/* ================= Runtime (給 bot/events/web 共用) ================= */
+const runtime = {
+  startedAt: Date.now(),
+  deps: {}, // { client, ... }
+  db: { pointsDb, roomsDb, historyDb, botState },
+  app,
+  server: null,
+};
+
+/** ✅ 把 Discord client / 其他依賴注入 runtime */
+function attachRuntime(webRuntime, deps = {}) {
+  // 兼容你可能傳進來的 webRuntime / 或直接用同一個 runtime
+  const target = webRuntime && typeof webRuntime === "object" ? webRuntime : runtime;
+
+  target.deps = target.deps || {};
+  Object.assign(target.deps, deps);
+
+  return target;
 }
 
 /* ================= Middleware ================= */
@@ -81,7 +103,7 @@ function jsonOK(res, data) {
 
 /* ================= Root / Health ================= */
 app.get("/", (req, res) => res.send("OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true, startedAt: runtime.startedAt }));
 
 /* ================= Login Page ================= */
 app.get("/admin/login", (req, res) => {
@@ -250,10 +272,11 @@ app.use((req, res) => res.status(404).send("Not Found"));
 /* ================= Start ================= */
 function startWeb() {
   const PORT = Number(process.env.PORT || 3000);
-  app.listen(PORT, () => console.log(`[Web] listening on ${PORT}`));
+  runtime.server = app.listen(PORT, () => console.log(`[Web] listening on ${PORT}`));
+  return runtime; // ✅ 這個很重要：index.js / events.js 會用
 }
 
-module.exports = { startWeb, app };
+module.exports = { startWeb, attachRuntime, app, runtime };
 
 /* -------------------- HTML -------------------- */
 function loginHtml(showErr) {
