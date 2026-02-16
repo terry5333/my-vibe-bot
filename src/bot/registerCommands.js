@@ -1,45 +1,302 @@
 "use strict";
 
 /**
- * src/bot/registerCommands.js
- * ✅ 預設只註冊 GUILD 指令（避免跟 GLOBAL 重複）
- * ✅ 可選擇一次性清掉 GLOBAL 指令（解決「同名兩份」）
+ * src/bot/commands.js
+ * ✅ index.js 會先 deferReply({ flags: Ephemeral })
+ *   → 這裡「不能再 interaction.reply()」避免 40060
+ * ✅ info / points / rank：私訊(ephemeral)
+ * ✅ start 類指令：直接在頻道發公告開始，然後 deleteReply() 把私訊 ack 刪掉
  */
 
-const { REST, Routes } = require("discord.js");
-const commands = require("./commands");
+const {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  MessageFlags,
+} = require("discord.js");
 
-async function registerCommands(client) {
-  const token = process.env.DISCORD_TOKEN;
-  if (!token) throw new Error("Missing env: DISCORD_TOKEN");
+const pointsDb = require("../db/points.js");
+const gamesMod = require("./games.js"); // module.exports = { games, onMessage }（你那份）
 
-  const guildId = process.env.DISCORD_GUILD_ID; // 建議一定要設
-  const appId = client.application?.id || client.user.id;
+function isAdmin(interaction) {
+  const perms = interaction.memberPermissions;
+  if (!perms) return false;
+  return (
+    perms.has(PermissionFlagsBits.Administrator) ||
+    perms.has(PermissionFlagsBits.ManageGuild)
+  );
+}
 
-  const rest = new REST({ version: "10" }).setToken(token);
+/**
+ * 私訊回覆（因為 index.js 已 deferReply(ephemeral)，這裡優先 editReply）
+ * 注意：editReply 不要帶 flags（flags 不能改），ephemeral 會沿用 deferReply 的設定
+ */
+async function replyPrivate(interaction, payload) {
+  const data = typeof payload === "string" ? { content: payload } : { ...payload };
 
-  const body = commands.commandData; // commands.js 裡 export 的 commandData
+  if (interaction.deferred || interaction.replied) {
+    return interaction.editReply(data);
+  }
+  // 保險：若沒 defer，也用 ephemeral
+  return interaction.reply({ ...data, flags: MessageFlags.Ephemeral });
+}
 
-  // ①（可選）清掉 GLOBAL，解決你「指令清單有兩個一樣的」
-  // 只需要跑一次：CLEAR_GLOBAL_COMMANDS=1
-  if (process.env.CLEAR_GLOBAL_COMMANDS === "1") {
-    try {
-      await rest.put(Routes.applicationCommands(appId), { body: [] });
-      console.log("[Commands] Cleared GLOBAL commands");
-    } catch (e) {
-      console.error("[Commands] Clear GLOBAL failed:", e);
+/**
+ * start 類：在頻道公開發「開始訊息」，然後刪掉那個 ephemeral ack
+ * 讓使用者看不到「已公開消息/已回覆」那個提示
+ */
+async function startPublicAndHideAck(interaction, publicContent) {
+  if (publicContent) await interaction.channel.send(publicContent);
+  try {
+    if (interaction.deferred || interaction.replied) await interaction.deleteReply();
+  } catch (_) {}
+}
+
+/* -------------------- 指令宣告（註冊用）-------------------- */
+const commandData = [
+  new SlashCommandBuilder()
+    .setName("info")
+    .setDescription("顯示機器人資訊與指令列表"),
+
+  new SlashCommandBuilder()
+    .setName("points")
+    .setDescription("查看自己的積分"),
+
+  new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("查看排行榜")
+    .addIntegerOption((o) =>
+      o.setName("top").setDescription("顯示前幾名（預設 10）").setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("counting")
+    .setDescription("數字接龍（在頻道直接輸入數字）")
+    .addSubcommand((s) =>
+      s
+        .setName("start")
+        .setDescription("開始一局 counting")
+        .addIntegerOption((o) =>
+          o.setName("start").setDescription("起始數字（預設 1）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) => s.setName("stop").setDescription("強制結束 counting"))
+    .addSubcommand((s) => s.setName("status").setDescription("查看 counting 狀態")),
+
+  new SlashCommandBuilder()
+    .setName("hl")
+    .setDescription("HL（按鈕式）")
+    .addSubcommand((s) =>
+      s
+        .setName("start")
+        .setDescription("開始一局 HL")
+        .addIntegerOption((o) =>
+          o.setName("max").setDescription("最大值（預設 100）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) => s.setName("stop").setDescription("結束 HL"))
+    .addSubcommand((s) => s.setName("status").setDescription("查看 HL 狀態")),
+
+  new SlashCommandBuilder()
+    .setName("guess")
+    .setDescription("終極密碼（在頻道直接輸入數字）")
+    .addSubcommand((s) =>
+      s
+        .setName("set")
+        .setDescription("直接在伺服器設定密碼數字（管理員）")
+        .addIntegerOption((o) =>
+          o.setName("secret").setDescription("密碼數字").setRequired(true)
+        )
+        .addIntegerOption((o) =>
+          o.setName("min").setDescription("最小值（預設 1）").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o.setName("max").setDescription("最大值（預設 100）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) =>
+      s
+        .setName("start")
+        .setDescription("開始終極密碼（自動隨機）")
+        .addIntegerOption((o) =>
+          o.setName("min").setDescription("最小值（預設 1）").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o.setName("max").setDescription("最大值（預設 100）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) => s.setName("stop").setDescription("結束終極密碼"))
+    .addSubcommand((s) => s.setName("status").setDescription("查看終極密碼狀態")),
+].map((c) => c.toJSON());
+
+/* -------------------- 指令執行（index.js 的 interactionCreate 會呼叫）-------------------- */
+async function execute(interaction, { client } = {}) {
+  const { commandName } = interaction;
+  const games = gamesMod?.games;
+
+  // /info（私）
+  if (commandName === "info") {
+    const e = new EmbedBuilder()
+      .setTitle("📌 指令列表")
+      .setDescription(
+        [
+          "🎮 遊戲：",
+          "• /counting start | stop | status（在頻道直接輸入數字）",
+          "• /hl start | stop | status（按鈕式）",
+          "• /guess set | start | stop | status（在頻道直接輸入數字）",
+          "",
+          "🏆 積分：",
+          "• /points 查看自己的分數",
+          "• /rank 查看排行榜",
+        ].join("\n")
+      )
+      .setFooter({ text: "提示：counting / guess 都是直接在頻道打數字" });
+
+    return replyPrivate(interaction, { embeds: [e] });
+  }
+
+  // /points（私）
+  if (commandName === "points") {
+    const p = pointsDb?.getPoints ? await pointsDb.getPoints(interaction.user.id) : 0;
+    return replyPrivate(interaction, `💰 <@${interaction.user.id}> 目前積分：**${p}**`);
+  }
+
+  // /rank（私）
+  if (commandName === "rank") {
+    const top = interaction.options.getInteger("top") || 10;
+    const rows = pointsDb?.getLeaderboard ? await pointsDb.getLeaderboard(top) : [];
+    if (!rows.length) return replyPrivate(interaction, "（目前沒有排行榜資料）");
+
+    const lines = rows.map((r, i) => `**${i + 1}.** <@${r.userId}>：**${r.points}** 分`);
+    const e = new EmbedBuilder().setTitle(`🏆 排行榜 Top ${top}`).setDescription(lines.join("\n"));
+    return replyPrivate(interaction, { embeds: [e] });
+  }
+
+  // /counting
+  if (commandName === "counting") {
+    if (!games?.countingStart) return replyPrivate(interaction, "❌ games 模組未載入（counting 無法使用）");
+
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return replyPrivate(interaction, "❌ 請選擇子指令，例如：/counting start");
+
+    const channelId = interaction.channelId;
+
+    if (sub === "start") {
+      const start = interaction.options.getInteger("start") || 1;
+      games.countingStart(channelId, start);
+
+      return startPublicAndHideAck(
+        interaction,
+        `✅ counting 已開始！請大家在本頻道依序輸入數字，從 **${start}** 開始。\n規則：同一人連打兩次或打錯就結束。`
+      );
+    }
+
+    if (sub === "stop") {
+      if (!isAdmin(interaction)) return replyPrivate(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      games.countingStop(channelId);
+      // stop 不用刪 ack，私訊回覆即可
+      return replyPrivate(interaction, "🛑 counting 已結束。");
+    }
+
+    if (sub === "status") {
+      const s = games.countingStatus(channelId);
+      if (!s?.active) return replyPrivate(interaction, "ℹ️ 本頻道沒有進行中的 counting。");
+      return replyPrivate(interaction, `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`);
     }
   }
 
-  // ② 註冊（優先 GUILD）
-  if (guildId) {
-    await rest.put(Routes.applicationGuildCommands(appId, guildId), { body });
-    console.log("[Commands] Registered GUILD slash commands");
-  } else {
-    // 沒設 guildId 才走 global（但你會更容易出現重複、也比較慢生效）
-    await rest.put(Routes.applicationCommands(appId), { body });
-    console.log("[Commands] Registered GLOBAL slash commands");
+  // /hl
+  if (commandName === "hl") {
+    if (!games?.hlStart) return replyPrivate(interaction, "❌ games 模組未載入（hl 無法使用）");
+
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return replyPrivate(interaction, "❌ 請選擇子指令，例如：/hl start");
+
+    const channelId = interaction.channelId;
+
+    if (sub === "start") {
+      const max = interaction.options.getInteger("max") || 100;
+
+      // 盡量避免 hlStart 去 interaction.reply
+      // 讓它自己用 channel.send（你的 games.js 如果已經是這樣就 OK）
+      const maybeMsg = await games.hlStart(interaction, channelId, max);
+
+      // 如果 hlStart 有回傳文字，就我們公開發出去；沒有就代表它自己發了
+      if (typeof maybeMsg === "string" && maybeMsg.trim()) {
+        return startPublicAndHideAck(interaction, maybeMsg);
+      }
+      return startPublicAndHideAck(interaction, null);
+    }
+
+    if (sub === "stop") {
+      if (!isAdmin(interaction)) return replyPrivate(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      games.hlStop(channelId);
+      return replyPrivate(interaction, "🛑 HL 已結束。");
+    }
+
+    if (sub === "status") {
+      const s = games.hlStatus(channelId);
+      if (!s?.active) return replyPrivate(interaction, "ℹ️ 本頻道沒有進行中的 HL。");
+      return replyPrivate(interaction, `ℹ️ HL 進行中（1 ~ ${s.max}）`);
+    }
   }
+
+  // /guess
+  if (commandName === "guess") {
+    if (!games?.guessStart) return replyPrivate(interaction, "❌ games 模組未載入（guess 無法使用）");
+
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return replyPrivate(interaction, "❌ 請選擇子指令，例如：/guess start");
+
+    const channelId = interaction.channelId;
+
+    if (sub === "set") {
+      if (!isAdmin(interaction)) return replyPrivate(interaction, "❌ 只有管理員可以 /guess set。");
+
+      const secret = interaction.options.getInteger("secret");
+      const min = interaction.options.getInteger("min") ?? 1;
+      const max = interaction.options.getInteger("max") ?? 100;
+
+      games.guessSet(channelId, { min, max, secret });
+
+      return startPublicAndHideAck(
+        interaction,
+        `✅ 終極密碼已設定！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
+      );
+    }
+
+    if (sub === "start") {
+      const min = interaction.options.getInteger("min") ?? 1;
+      const max = interaction.options.getInteger("max") ?? 100;
+
+      games.guessStart(channelId, { min, max });
+
+      return startPublicAndHideAck(
+        interaction,
+        `✅ 終極密碼開始！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
+      );
+    }
+
+    if (sub === "stop") {
+      if (!isAdmin(interaction)) return replyPrivate(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      games.guessStop(channelId);
+      return replyPrivate(interaction, "🛑 終極密碼已結束。");
+    }
+
+    if (sub === "status") {
+      const s = games.guessStatus(channelId);
+      if (!s?.active) return replyPrivate(interaction, "ℹ️ 本頻道沒有進行中的終極密碼。");
+      return replyPrivate(interaction, `ℹ️ 終極密碼範圍：**${s.min} ~ ${s.max}**`);
+    }
+  }
+
+  return replyPrivate(interaction, `❌ 未處理的指令：/${commandName}`);
 }
 
-module.exports = { registerCommands };
+module.exports = {
+  commandData,
+  execute,
+
+  // 相容你原本 events.js 那種取法（如果你還留著）
+  getCommand: (name) => ({ execute: (i, ctx) => execute(i, ctx) }),
+};
