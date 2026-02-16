@@ -2,12 +2,16 @@
 
 /**
  * src/bot/commands.js
- * - index.js 會先 deferReply({ flags: Ephemeral })
- * - 這裡「不要再 interaction.reply()」
- * - start 類指令：直接 channel.send() 開始，然後 interaction.deleteReply() 清掉 ACK
+ * - 查詢類：editReply（私密）
+ * - 遊戲 start/stop：channel.send + deleteReply（直接開始，不留互動回覆）
  */
 
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require("discord.js");
+const {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  MessageFlags,
+} = require("discord.js");
 
 const pointsDb = require("../db/points.js");
 const gamesMod = require("./games.js"); // module.exports = { games, onMessage }
@@ -21,21 +25,20 @@ function isAdmin(interaction) {
   );
 }
 
-// ✅ index.js 已 deferReply，這裡統一用 editReply（避免 40060）
-async function ack(interaction, content) {
-  if (interaction.deferred || interaction.replied) {
-    return interaction.editReply(content);
-  }
-  // 保底（理論上不會走到）
-  return interaction.reply({ content });
+// 私密回覆（你 index.js 已經 deferReply(EPHEMERAL) 了，所以這裡主要用 editReply）
+async function ephem(interaction, payload) {
+  const data = typeof payload === "string" ? { content: payload } : payload;
+  if (interaction.deferred || interaction.replied) return interaction.editReply(data);
+  return interaction.reply({ ...data, flags: MessageFlags.Ephemeral });
 }
 
-// ✅ start 類：在頻道送訊息，然後刪掉 defer 的回覆（你要的「直接開始」）
-async function startInChannel(interaction, message) {
+// 公開送到頻道，然後把互動回覆刪掉（避免你看到「已公開消息」互動回覆）
+async function pub(interaction, payload) {
+  const data = typeof payload === "string" ? { content: payload } : payload;
   if (interaction.channel) {
-    await interaction.channel.send(message);
+    await interaction.channel.send(data);
   }
-  // 把「思考中/ephemeral」那個回覆刪掉，使用者就不會看到任何提示
+  // 刪掉 defer 的那個私密互動回覆
   try {
     if (interaction.deferred || interaction.replied) {
       await interaction.deleteReply();
@@ -121,7 +124,7 @@ const commandData = [
 ].map((c) => c.toJSON());
 
 /* -------------------- 指令執行 -------------------- */
-async function execute(interaction, { client, webRuntime } = {}) {
+async function execute(interaction, { client } = {}) {
   const { commandName } = interaction;
   const games = gamesMod?.games;
 
@@ -142,120 +145,104 @@ async function execute(interaction, { client, webRuntime } = {}) {
       )
       .setFooter({ text: "提示：counting / guess 都是直接在頻道打數字" });
 
-    // 這個可以留在 ephemeral（editReply）
-    return interaction.editReply({ embeds: [e] });
+    return ephem(interaction, { embeds: [e] });
   }
 
   if (commandName === "points") {
     const p = pointsDb?.getPoints ? await pointsDb.getPoints(interaction.user.id) : 0;
-    return ack(interaction, `💰 <@${interaction.user.id}> 目前積分：**${p}**`);
+    return ephem(interaction, `💰 <@${interaction.user.id}> 目前積分：**${p}**`);
   }
 
   if (commandName === "rank") {
     const top = interaction.options.getInteger("top") || 10;
     const rows = pointsDb?.getLeaderboard ? await pointsDb.getLeaderboard(top) : [];
-    if (!rows.length) return ack(interaction, "（目前沒有排行榜資料）");
+    if (!rows.length) return ephem(interaction, "（目前沒有排行榜資料）");
 
     const lines = rows.map((r, i) => `**${i + 1}.** <@${r.userId}>：**${r.points}** 分`);
     const e = new EmbedBuilder().setTitle(`🏆 排行榜 Top ${top}`).setDescription(lines.join("\n"));
-    return interaction.editReply({ embeds: [e] });
+    return ephem(interaction, { embeds: [e] });
   }
 
   if (commandName === "counting") {
-    if (!games?.countingStart) return ack(interaction, "❌ games 模組未載入（counting 無法使用）");
+    if (!games?.countingStart) return ephem(interaction, "❌ games 模組未載入（counting 無法使用）");
 
     const sub = interaction.options.getSubcommand(false);
-    const channelId = interaction.channelId;
+    if (!sub) return ephem(interaction, "❌ 請選擇子指令：start / stop / status");
 
-    if (!sub) {
-      return ack(interaction, "用法：/counting start | stop | status");
-    }
+    const channelId = interaction.channelId;
 
     if (sub === "start") {
       const start = interaction.options.getInteger("start") || 1;
       games.countingStart(channelId, start);
-
-      // ✅ 直接開始：在頻道公告 + 刪掉 interaction 回覆
-      return startInChannel(
+      return pub(
         interaction,
-        `✅ **counting 已開始！**\n請大家在本頻道依序輸入數字，從 **${start}** 開始。\n規則：同一人連打兩次或打錯就結束。`
+        `✅ counting 已開始！請大家在本頻道依序輸入數字，從 **${start}** 開始。\n規則：同一人連打兩次或打錯就結束。`
       );
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return ack(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return ephem(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
       games.countingStop(channelId);
-      // stop 可以選擇公告在頻道，或只回覆你（我用頻道公告比較直覺）
-      return startInChannel(interaction, "🛑 **counting 已結束。**");
+      return pub(interaction, "🛑 counting 已結束。");
     }
 
     if (sub === "status") {
       const s = games.countingStatus(channelId);
-      if (!s?.active) return ack(interaction, "ℹ️ 本頻道沒有進行中的 counting。");
-      return ack(interaction, `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`);
+      if (!s?.active) return ephem(interaction, "ℹ️ 本頻道沒有進行中的 counting。");
+      return ephem(interaction, `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`);
     }
   }
 
   if (commandName === "hl") {
-    if (!games?.hlStart) return ack(interaction, "❌ games 模組未載入（hl 無法使用）");
+    if (!games?.hlStart) return ephem(interaction, "❌ games 模組未載入（hl 無法使用）");
 
     const sub = interaction.options.getSubcommand(false);
-    const channelId = interaction.channelId;
+    if (!sub) return ephem(interaction, "❌ 請選擇子指令：start / stop / status");
 
-    if (!sub) {
-      return ack(interaction, "用法：/hl start | stop | status");
-    }
+    const channelId = interaction.channelId;
 
     if (sub === "start") {
       const max = interaction.options.getInteger("max") || 100;
 
-      // hlStart 你原本說「會自己送訊息」：那就不要再回覆任何東西
+      // 建議：hlStart 內部要用 channel.send，不要 interaction.reply
       await games.hlStart(interaction, channelId, max);
 
-      // ✅ 刪掉 interaction 的回覆（使用者不會看到任何「已公開/ephemeral」）
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.deleteReply();
-        }
-      } catch (_) {}
+      // 直接開始：不留互動回覆
+      try { await interaction.deleteReply(); } catch (_) {}
       return;
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return ack(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return ephem(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
       games.hlStop(channelId);
-      return startInChannel(interaction, "🛑 **HL 已結束。**");
+      return pub(interaction, "🛑 HL 已結束。");
     }
 
     if (sub === "status") {
       const s = games.hlStatus(channelId);
-      if (!s?.active) return ack(interaction, "ℹ️ 本頻道沒有進行中的 HL。");
-      return ack(interaction, `ℹ️ HL 進行中（1 ~ ${s.max}）`);
+      if (!s?.active) return ephem(interaction, "ℹ️ 本頻道沒有進行中的 HL。");
+      return ephem(interaction, `ℹ️ HL 進行中（1 ~ ${s.max}）`);
     }
   }
 
   if (commandName === "guess") {
-    if (!games?.guessStart) return ack(interaction, "❌ games 模組未載入（guess 無法使用）");
+    if (!games?.guessStart) return ephem(interaction, "❌ games 模組未載入（guess 無法使用）");
 
     const sub = interaction.options.getSubcommand(false);
+    if (!sub) return ephem(interaction, "❌ 請選擇子指令：set / start / stop / status");
+
     const channelId = interaction.channelId;
 
-    if (!sub) {
-      return ack(interaction, "用法：/guess set | start | stop | status");
-    }
-
     if (sub === "set") {
-      if (!isAdmin(interaction)) return ack(interaction, "❌ 只有管理員可以 /guess set。");
+      if (!isAdmin(interaction)) return ephem(interaction, "❌ 只有管理員可以 /guess set。");
       const secret = interaction.options.getInteger("secret");
       const min = interaction.options.getInteger("min") ?? 1;
       const max = interaction.options.getInteger("max") ?? 100;
 
       games.guessSet(channelId, { min, max, secret });
-
-      // ✅ 直接開始提示在頻道 + 刪掉 interaction 回覆
-      return startInChannel(
+      return pub(
         interaction,
-        `✅ **終極密碼已設定並開始！**\n範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
+        `✅ 終極密碼已設定！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
       );
     }
 
@@ -263,32 +250,30 @@ async function execute(interaction, { client, webRuntime } = {}) {
       const min = interaction.options.getInteger("min") ?? 1;
       const max = interaction.options.getInteger("max") ?? 100;
       games.guessStart(channelId, { min, max });
-
-      // ✅ 直接開始提示在頻道 + 刪掉 interaction 回覆
-      return startInChannel(
+      return pub(
         interaction,
-        `✅ **終極密碼開始！**\n範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
+        `✅ 終極密碼開始！範圍 **${min} ~ ${max}**。\n請大家直接在本頻道輸入數字猜（猜中 +10 分）。`
       );
     }
 
     if (sub === "stop") {
-      if (!isAdmin(interaction)) return ack(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
+      if (!isAdmin(interaction)) return ephem(interaction, "❌ 需要管理員權限（Manage Server）才能 stop。");
       games.guessStop(channelId);
-      return startInChannel(interaction, "🛑 **終極密碼已結束。**");
+      return pub(interaction, "🛑 終極密碼已結束。");
     }
 
     if (sub === "status") {
       const s = games.guessStatus(channelId);
-      if (!s?.active) return ack(interaction, "ℹ️ 本頻道沒有進行中的終極密碼。");
-      return ack(interaction, `ℹ️ 終極密碼範圍：**${s.min} ~ ${s.max}**`);
+      if (!s?.active) return ephem(interaction, "ℹ️ 本頻道沒有進行中的終極密碼。");
+      return ephem(interaction, `ℹ️ 終極密碼範圍：**${s.min} ~ ${s.max}**`);
     }
   }
 
-  return ack(interaction, `❌ 未處理的指令：/${commandName}`);
+  return ephem(interaction, `❌ 未處理的指令：/${commandName}`);
 }
 
 module.exports = {
-  commandData, // 給 registerCommands 用
-  getCommand: (name) => ({ execute: (i, ctx) => execute(i, ctx) }),
+  commandData,
   execute,
+  getCommand: (name) => ({ execute: (i, ctx) => execute(i, ctx) }),
 };
