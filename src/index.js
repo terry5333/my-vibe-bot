@@ -1,19 +1,10 @@
 "use strict";
 
-/**
- * ✅ Discord Developer Portal Intents 設定（不然文字遊戲會失效）
- * 1) 到 Developer Portal -> Bot -> Privileged Gateway Intents
- * 2) 開啟：
- *    - MESSAGE CONTENT INTENT（必要，終極密碼/counting 需要讀訊息內容）
- *    - SERVER MEMBERS INTENT（可選，想拿更完整玩家資訊可開）
- * 3) 程式端 intents 也必須包含 GatewayIntentBits.MessageContent
- */
-
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { initFirebase } = require("./db/firebase");
-const { registerCommands } = require("./bot/commands");
+const { registerCommands, makeCommandHandlers } = require("./bot/commands");
 const { bindDiscordEvents } = require("./bot/events");
-const { startWeb, attachRuntime } = require("./web/server");
+const { startWeb } = require("./web/server"); // attachRuntime 先不要用（你目前會炸）
 
 async function main() {
   initFirebase();
@@ -22,21 +13,22 @@ async function main() {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent, // ✅ 必須
+      GatewayIntentBits.MessageContent, // counting 需要
     ],
     partials: [Partials.Channel],
   });
 
-  // Web 先開（Railway/Render 要用）
-  const webRuntime = startWeb();
-  attachRuntime(webRuntime, { client });
+  // 建立指令處理器
+  makeCommandHandlers(client);
 
-  bindDiscordEvents(client, webRuntime);
+  // 綁事件（slash + counting message）
+  bindDiscordEvents(client);
+
+  // Web（可先開，後台再處理）
+  startWeb();
 
   client.once("ready", async () => {
     console.log("[Discord] Logged in as", client.user.tag);
-
-    // 自動註冊 Slash Commands（global 可能需要幾分鐘才生效；有 GUILD_ID 會秒生效）
     await registerCommands();
   });
 
