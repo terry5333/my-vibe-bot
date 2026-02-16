@@ -99,3 +99,31 @@ client.on("interactionCreate", async (interaction) => {
 
     // 你 commands.js 內部請用 editReply / followUp
     await commands.execute(interaction, { client });
+
+  } catch (err) {
+    console.error("[interactionCreate] error:", err);
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
+      } else {
+        await interaction.reply({ content: "❌ 指令執行出錯，請稍後再試。" });
+      }
+    } catch (_) {}
+  }
+});
+
+// ✅ counting / guess 用訊息輸入（messageCreate）
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author.bot) return;
+
+    if (typeof gamesMod?.onMessage === "function") {
+      await gamesMod.onMessage(message, { client });
+    }
+  } catch (err) {
+    console.error("[messageCreate] error:", err);
+  }
+});
+
+client.login(DISCORD_TOKEN);
