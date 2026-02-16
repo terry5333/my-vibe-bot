@@ -1,110 +1,101 @@
 "use strict";
 
 /**
- * src/index.js
- * ✅ 只保留 1 個 interactionCreate handler（避免回覆兩次）
- * ✅ 处理：slash / button / modal
- * ✅ ready/clientReady 相容（避免 ready 觸發兩次）
+ * src/index.js (A 方案)
+ * ✅ 只在這裡註冊 interactionCreate / messageCreate
+ * ✅ 防止同一個 interaction 被處理兩次（同進程保險）
  */
 
-const { Client, GatewayIntentBits, Partials, Events } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const adminCommands = require("./bot/commands_admin");
-const { ensureLobbyPosts, handleLobbyInteraction } = require("./bot/lobbyButtons");
-const { handleCountingMessage, tryCleanupExpiredPunishments } = require("./bot/warnings");
 
-// ---- env ----
+// 你的指令執行器（你原本那份）
+const commands = require("./bot/commands");
+
+// 遊戲（counting/guess/hl）
+const gamesMod = require("./bot/games");
+
+// Firebase（可選：不一定有）
+let initFirebaseFn = null;
+try {
+  const fb = require("./db/firebase");
+  initFirebaseFn = typeof fb === "function" ? fb : fb?.initFirebase;
+} catch (_) {}
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error("❌ Missing env: DISCORD_TOKEN");
   process.exit(1);
 }
 
-// ---- client ----
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // counting 需要讀訊息
-    GatewayIntentBits.GuildMembers, // 需要加/移除身份組
-    GatewayIntentBits.DirectMessages, // DM 提醒（需要 partials）
+    GatewayIntentBits.MessageContent, // counting/guess 需要讀訊息
   ],
   partials: [Partials.Channel],
 });
 
-// ---- firebase (可選) 超保守相容：function / {initFirebase} / {default} ----
-try {
-  const fb = require("./db/firebase");
-  const initFirebase = fb?.initFirebase || fb?.default || fb;
-  if (typeof initFirebase === "function") initFirebase();
-} catch (_) {}
+// ✅ 可選初始化 Firebase
+if (typeof initFirebaseFn === "function") {
+  try {
+    initFirebaseFn();
+    console.log("[Firebase] Initialized");
+  } catch (e) {
+    console.warn("[Firebase] init failed (ignore):", e?.message || e);
+  }
+}
 
-let readyOnce = false;
-async function onReady() {
-  if (readyOnce) return;
-  readyOnce = true;
+// ✅ 防止同一個 interaction 在同一進程被跑兩次
+const handledInteractions = new Set();
+function markHandled(interactionId) {
+  if (handledInteractions.has(interactionId)) return false;
+  handledInteractions.add(interactionId);
+  // 1 分鐘後清掉，避免 Set 無限增長
+  setTimeout(() => handledInteractions.delete(interactionId), 60_000).unref?.();
+  return true;
+}
 
+client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
+  console.log("PID =", process.pid);
 
   try {
-    await registerCommands();
+    await registerCommands(client);
     console.log("[Commands] registered");
   } catch (e) {
     console.error("[Commands] register failed:", e);
   }
 
-  // ✅ 發送大廳按鈕 & 規則查詢按鈕（只會補上，不會一直狂洗）
+  console.log("interactionCreate listeners =", client.listenerCount("interactionCreate"));
+});
+
+// ✅ 唯一的 interactionCreate
+client.on("interactionCreate", async (interaction) => {
   try {
-    await ensureLobbyPosts(client);
-  } catch (e) {
-    console.error("[Lobby] ensure posts failed:", e);
-  }
-}
+    // 1) HL 按鈕（Button interaction）
+    if (interaction.isButton()) {
+      // 同進程保險：避免按鈕互動也被處理兩次
+      if (!markHandled(interaction.id)) return;
 
-client.once(Events.ClientReady ?? "clientReady", onReady);
-client.once("ready", onReady);
-
-// ✅ 唯一 interactionCreate（所有互動都走這裡）
-client.on(Events.InteractionCreate ?? "interactionCreate", async (interaction) => {
-  try {
-    // 1) Slash commands
-    if (interaction.isChatInputCommand()) {
-      await adminCommands.execute(interaction, { client });
-      return;
-    }
-
-    // 2) Lobby buttons / Room buttons / Modals
-    if (interaction.isButton() || interaction.isModalSubmit()) {
-      await handleLobbyInteraction(interaction, { client });
-      return;
-    }
-  } catch (err) {
-    console.error("[interactionCreate] error:", err);
-    // 按鈕/Modal 可能沒 defer，這裡盡量不炸
-    try {
-      if (interaction.isRepliable()) {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply("❌ 發生錯誤，請再試一次。");
-        } else {
-          await interaction.reply({ content: "❌ 發生錯誤，請再試一次。", ephemeral: true });
-        }
+      if (typeof gamesMod?.onInteraction === "function") {
+        await gamesMod.onInteraction(interaction, { client });
       }
-    } catch (_) {}
-  }
-});
+      return;
+    }
 
-// counting：只允許數字 + 非數字刪除 + 2次文字 -> ⚠️賤人 3天 / 再犯 -> 永久
-client.on(Events.MessageCreate ?? "messageCreate", async (message) => {
-  try {
-    if (message.author.bot) return;
-    if (!message.guild) return;
+    // 2) Slash Command
+    if (!interaction.isChatInputCommand()) return;
 
-    await tryCleanupExpiredPunishments(message.guild);
-    await handleCountingMessage(message, { client });
-  } catch (err) {
-    console.error("[messageCreate] error:", err);
-  }
-});
+    // 同進程保險：避免 slash 被處理兩次
+    if (!markHandled(interaction.id)) return;
 
-client.login(DISCORD_TOKEN);
+    // 避免 3 秒超時（不設 ephemeral，避免「僅你可見」那種標籤）
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply(); // public thinking
+    }
+
+    // 你 commands.js 內部請用 editReply / followUp
+    await commands.execute(interaction, { client });
