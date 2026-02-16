@@ -2,13 +2,7 @@
 
 /**
  * src/bot/games.js
- *
- * ✅ 你的需求：
- * 1) guess 不用 try：管理員直接 /guess set <number> 改答案
- * 2) counting 對/錯都要表情符號
- * 3) counting 同人連打 或 有人打錯 → 直接結束
- * 4) hl 改按鈕式
- * 5) 全部遊戲加分：counting +2 / hl +5 / 終極密碼 +10
+ * 修正：模板字串內不能直接再放 `...`
  */
 
 const {
@@ -20,14 +14,12 @@ const {
 
 const pointsDb = require("../db/points.js");
 
-// ===== 加分規則（你要改就改這裡）=====
 const SCORE = {
   COUNTING_OK: 2,
   HL_OK: 5,
   GUESS_OK: 10,
 };
 
-// ===== 記憶體狀態（簡單版：重啟會清空）=====
 const state = {
   counting: new Map(), // channelId -> { active, expected, lastUserId }
   hl: new Map(),       // channelId -> { active, max, secret, msgId }
@@ -51,19 +43,16 @@ function countingStatus(channelId) {
   return state.counting.get(channelId) || { active: false };
 }
 
-// ✅ counting 的 message handler：在頻道直接打數字
 async function countingOnMessage(message) {
   const channelId = message.channelId;
   const s = state.counting.get(channelId);
   if (!s || !s.active) return;
 
-  // 只接受「純數字」
   const text = (message.content || "").trim();
   if (!/^\d+$/.test(text)) return;
 
   const num = Number(text);
 
-  // 連續同一人打 → 直接結束
   if (s.lastUserId && s.lastUserId === message.author.id) {
     await safeReact(message, "⛔");
     await message.channel.send(`🛑 **counting 結束**：<@${message.author.id}> 連續打了兩次！`);
@@ -71,7 +60,6 @@ async function countingOnMessage(message) {
     return;
   }
 
-  // 打錯 → 直接結束
   if (num !== s.expected) {
     await safeReact(message, "❌");
     await message.channel.send(`🛑 **counting 結束**：打錯了！應該是 **${s.expected}**`);
@@ -79,16 +67,11 @@ async function countingOnMessage(message) {
     return;
   }
 
-  // 打對：✅ +2 分
   await safeReact(message, "✅");
   s.lastUserId = message.author.id;
   s.expected += 1;
 
-  // 加分
   await safeAddPoints(message.author.id, SCORE.COUNTING_OK);
-
-  // 可選：你想要每次提示下一個也行（會吵就關掉）
-  // await message.channel.send(`下一個：**${s.expected}**`);
 }
 
 // -------------------- HL（按鈕式）--------------------
@@ -96,10 +79,9 @@ async function hlStart(interaction, channelId, max = 100) {
   max = Number(max) || 100;
   if (max < 2) max = 2;
 
-  // 如果已經有一局
   const cur = state.hl.get(channelId);
   if (cur?.active) {
-    return "❗ 本頻道已經有一局 hl 進行中，請先 `/hl stop`。";
+    return "❗ 本頻道已經有一局 hl 進行中，請先 /hl stop。";
   }
 
   const secret = 1 + Math.floor(Math.random() * max);
@@ -118,8 +100,6 @@ async function hlStart(interaction, channelId, max = 100) {
     new ButtonBuilder().setCustomId("hl_stop").setLabel("結束").setStyle(ButtonStyle.Secondary),
   );
 
-  // 你可以改成「顯示目前線索」，我先做最直覺：
-  // 讓大家按：偏小/偏大/剛好（剛好才算中）
   const sent = await interaction.channel.send({
     content: `🎲 **HL 開始！**（1 ~ ${max}）\n按按鈕猜：偏小 / 偏大 / 剛好`,
     components: [row],
@@ -130,7 +110,7 @@ async function hlStart(interaction, channelId, max = 100) {
 
   const collector = sent.createMessageComponentCollector({
     componentType: ComponentType.Button,
-    time: 60 * 1000, // 60 秒
+    time: 60 * 1000,
   });
 
   collector.on("collect", async (btn) => {
@@ -140,7 +120,6 @@ async function hlStart(interaction, channelId, max = 100) {
       return;
     }
 
-    // 結束按鈕
     if (btn.customId === "hl_stop") {
       st2.active = false;
       state.hl.delete(channelId);
@@ -150,20 +129,9 @@ async function hlStart(interaction, channelId, max = 100) {
       return;
     }
 
-    // 判定：只有「剛好」且剛好猜中才算中
-    // 這版 HL 我做成「猜剛好」= 中獎；偏小/偏大會回提示（不加分）
-    if (btn.customId === "hl_equal") {
-      // ✅ 讓它真的「剛好」才算中：需要玩家同時輸入數字？你沒要輸入數字
-      // 所以這裡改成：按「剛好」就是賭一把，若 secret 落在中間？會很怪
-      // ✅ 更合理做法：HL 改成「系統出一個 current，玩家猜下一個會高或低」
-      // 但你只說要按鈕式，我先做一個「下一張牌高低」版（更標準）
-      // ---- 下面直接切成高低牌玩法 ----
-    }
-
-    // === 高低牌玩法（標準 HL 按鈕）===
-    // 我們把 secret 當作「下一張」，再生成一張 current
+    // 標準「高低牌」玩法：先抽 current，再用 secret 當 next
     const current = 1 + Math.floor(Math.random() * st2.max);
-    const next = st2.secret; // 下一張固定 secret
+    const next = st2.secret;
 
     let correct = false;
     if (btn.customId === "hl_low") correct = next < current;
@@ -172,6 +140,7 @@ async function hlStart(interaction, channelId, max = 100) {
 
     if (correct) {
       await safeAddPoints(btn.user.id, SCORE.HL_OK);
+
       st2.active = false;
       state.hl.delete(channelId);
       collector.stop("win");
@@ -186,15 +155,15 @@ async function hlStart(interaction, channelId, max = 100) {
       return;
     }
 
-    // 猜錯：只回覆提示，不結束（你沒有說 hl 猜錯要結束，所以保留繼續）
+    // ❌ 這行之前炸掉就是因為你塞了 `...` 反引號
     try {
       await btn.reply({
-        content: `❌ 猜錯～\n目前：**${current}** → 下一張：**${next}**\n（再開一局請 `/hl start`）`,
+        content: `❌ 猜錯～\n目前：**${current}** → 下一張：**${next}**\n（再開一局請 /hl start）`,
         ephemeral: true,
       });
     } catch {}
 
-    // 這局我做成「猜一次就結束」，避免一直刷按鈕
+    // 這版設計：猜一次就結束（避免按鈕狂刷）
     st2.active = false;
     state.hl.delete(channelId);
     collector.stop("end");
@@ -202,7 +171,6 @@ async function hlStart(interaction, channelId, max = 100) {
   });
 
   collector.on("end", async () => {
-    // 如果時間到還沒結束，清掉按鈕
     try {
       const st3 = state.hl.get(channelId);
       if (st3?.active) state.hl.delete(channelId);
@@ -230,8 +198,8 @@ function guessSet(channelId, { min = 1, max = 100, secret }) {
   secret = Number(secret);
 
   if (!Number.isFinite(secret)) throw new Error("secret must be a number");
-
   if (min > max) [min, max] = [max, min];
+
   if (secret < min) secret = min;
   if (secret > max) secret = max;
 
@@ -244,7 +212,6 @@ function guessStart(channelId, { min = 1, max = 100 } = {}) {
   if (min > max) [min, max] = [max, min];
 
   const cur = state.guess.get(channelId);
-  // 如果之前已 set 過答案就沿用，不然隨機
   const secret =
     cur?.secret && cur.secret >= min && cur.secret <= max
       ? cur.secret
@@ -270,11 +237,8 @@ async function guessOnMessage(message) {
   if (!/^\d+$/.test(text)) return;
 
   const num = Number(text);
-
-  // 超出範圍就忽略（或你要提示也可以）
   if (num < s.min || num > s.max) return;
 
-  // 猜到：+10 分，結束
   if (num === s.secret) {
     await safeReact(message, "🎉");
     await safeAddPoints(message.author.id, SCORE.GUESS_OK);
@@ -285,7 +249,6 @@ async function guessOnMessage(message) {
     return;
   }
 
-  // 沒猜到：縮範圍提示（終極密碼標準玩法）
   if (num < s.secret) {
     s.min = Math.max(s.min, num + 1);
     await safeReact(message, "⬆️");
@@ -297,15 +260,12 @@ async function guessOnMessage(message) {
     s.max = Math.min(s.max, num - 1);
     await safeReact(message, "⬇️");
     await message.channel.send(`⬇️ 太大了！新範圍：**${s.min} ~ ${s.max}**`);
-    return;
   }
 }
 
-// -------------------- 安全工具 --------------------
+// -------------------- 工具 --------------------
 async function safeReact(message, emoji) {
-  try {
-    await message.react(emoji);
-  } catch {}
+  try { await message.react(emoji); } catch {}
 }
 
 async function safeAddPoints(userId, delta) {
@@ -317,12 +277,10 @@ async function safeAddPoints(userId, delta) {
   }
 }
 
-// -------------------- 對外提供給 events.js 用 --------------------
-async function onMessage(message, { client, webRuntime } = {}) {
-  // counting / guess 都是「頻道直接輸入數字」模式
+// 給 events.js 用
+async function onMessage(message) {
   await countingOnMessage(message);
   await guessOnMessage(message);
-  // hl 是按鈕，不用 message
 }
 
 const games = {
