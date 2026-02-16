@@ -4,7 +4,6 @@ const state = require("./state");
 
 function bindDiscordEvents(client) {
   // Slash 指令處理
-  client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
     const name = interaction.commandName;
