@@ -13,7 +13,7 @@ const {
 } = require("discord.js");
 
 const pointsDb = require("../db/points.js");
-const gamesMod = require("./games.js"); // module.exports = { games, onMessage }
+const gamesMod = require("./games.js"); // { games, onMessage }
 
 function isAdmin(interaction) {
   const perms = interaction.memberPermissions;
@@ -25,10 +25,16 @@ function isAdmin(interaction) {
 }
 
 async function reply(interaction, content, ephemeral = true) {
+  // ✅ 防止 40060：永遠只用「一次回覆」
   if (interaction.deferred || interaction.replied) {
-    return interaction.editReply(content);
+    return interaction.editReply(
+      typeof content === "string" ? { content } : content
+    );
   }
-  return interaction.reply({ content, ephemeral });
+  if (typeof content === "string") {
+    return interaction.reply({ content, ephemeral });
+  }
+  return interaction.reply(content);
 }
 
 /* -------------------- 指令宣告（用來註冊）-------------------- */
@@ -109,10 +115,8 @@ const commandData = [
 ].map((c) => c.toJSON());
 
 /* -------------------- 指令執行（interactionCreate 會呼叫）-------------------- */
-async function execute(interaction, { client, webRuntime } = {}) {
+async function execute(interaction, { client } = {}) {
   const { commandName } = interaction;
-
-  // 確保 games 模組存在
   const games = gamesMod?.games;
 
   if (commandName === "info") {
@@ -153,7 +157,9 @@ async function execute(interaction, { client, webRuntime } = {}) {
   if (commandName === "counting") {
     if (!games?.countingStart) return reply(interaction, "❌ games 模組未載入（counting 無法使用）");
 
-    const sub = interaction.options.getSubcommand();
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return reply(interaction, "請選擇子指令：/counting start | stop | status", true);
+
     const channelId = interaction.channelId;
 
     if (sub === "start") {
@@ -182,7 +188,9 @@ async function execute(interaction, { client, webRuntime } = {}) {
   if (commandName === "hl") {
     if (!games?.hlStart) return reply(interaction, "❌ games 模組未載入（hl 無法使用）");
 
-    const sub = interaction.options.getSubcommand();
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return reply(interaction, "請選擇子指令：/hl start | stop | status", true);
+
     const channelId = interaction.channelId;
 
     if (sub === "start") {
@@ -207,7 +215,9 @@ async function execute(interaction, { client, webRuntime } = {}) {
   if (commandName === "guess") {
     if (!games?.guessStart) return reply(interaction, "❌ games 模組未載入（guess 無法使用）");
 
-    const sub = interaction.options.getSubcommand();
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub) return reply(interaction, "請選擇子指令：/guess set | start | stop | status", true);
+
     const channelId = interaction.channelId;
 
     if (sub === "set") {
@@ -251,7 +261,7 @@ async function execute(interaction, { client, webRuntime } = {}) {
   return reply(interaction, `❌ 未處理的指令：/${commandName}`, true);
 }
 
-/* ✅ 這個就是你缺的「指令處理器」：給 index.js 用 */
+/* ✅ 給 index.js 使用 */
 function makeCommandHandlers(ctx = {}) {
   return {
     info: (i) => execute(i, ctx),
@@ -264,7 +274,7 @@ function makeCommandHandlers(ctx = {}) {
 }
 
 module.exports = {
-  commandData,          // 給 registerCommands 用
-  execute,              // 可直接呼叫
-  makeCommandHandlers,  // ✅ 給 index.js 用（你現在缺的就是它）
+  commandData,
+  execute,
+  makeCommandHandlers,
 };
