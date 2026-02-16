@@ -2,36 +2,36 @@
 
 const admin = require("firebase-admin");
 
-let _db = null;
+let _app = null;
 
 function initFirebase() {
-  if (_db) return _db;
+  if (_app) return _app;
 
   const raw = process.env.FIREBASE_CONFIG;
-  if (!raw) throw new Error("缺少 FIREBASE_CONFIG env（請放 service account JSON）");
+  const databaseURL = process.env.FIREBASE_DB_URL;
+
+  if (!raw) throw new Error("Missing env: FIREBASE_CONFIG");
+  if (!databaseURL) throw new Error("Missing env: FIREBASE_DB_URL");
 
   let serviceAccount;
   try {
     serviceAccount = JSON.parse(raw);
   } catch {
-    throw new Error("FIREBASE_CONFIG 不是合法 JSON（請確認是一行 JSON 字串）");
+    throw new Error("FIREBASE_CONFIG must be valid JSON (single line).");
   }
 
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: "https://my-pos-4eeee-default-rtdb.asia-southeast1.firebasedatabase.app",
-    });
-  }
+  _app = admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL,
+  });
 
-  _db = admin.database();
   console.log("[Firebase] Initialized");
-  return _db;
+  return _app;
 }
 
 function getDB() {
-  if (!_db) return initFirebase();
-  return _db;
+  if (!_app) initFirebase();
+  return admin.database();
 }
 
 module.exports = { initFirebase, getDB };
