@@ -13,7 +13,7 @@ const {
 } = require("discord.js");
 
 const pointsDb = require("../db/points.js");
-const gamesMod = require("./games.js"); // 你剛剛那份 games.js：module.exports = { games, onMessage }
+const gamesMod = require("./games.js"); // module.exports = { games, onMessage }
 
 function isAdmin(interaction) {
   const perms = interaction.memberPermissions;
@@ -175,11 +175,7 @@ async function execute(interaction, { client, webRuntime } = {}) {
     if (sub === "status") {
       const s = games.countingStatus(channelId);
       if (!s?.active) return reply(interaction, "ℹ️ 本頻道沒有進行中的 counting。", true);
-      return reply(
-        interaction,
-        `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`,
-        true
-      );
+      return reply(interaction, `ℹ️ counting 進行中：下一個應該輸入 **${s.expected}**`, true);
     }
   }
 
@@ -192,7 +188,6 @@ async function execute(interaction, { client, webRuntime } = {}) {
     if (sub === "start") {
       const max = interaction.options.getInteger("max") || 100;
       const msg = await games.hlStart(interaction, channelId, max);
-      // hlStart 會自己送訊息，這裡給一個簡短回覆避免空白
       return reply(interaction, msg, true);
     }
 
@@ -256,8 +251,20 @@ async function execute(interaction, { client, webRuntime } = {}) {
   return reply(interaction, `❌ 未處理的指令：/${commandName}`, true);
 }
 
+/* ✅ 這個就是你缺的「指令處理器」：給 index.js 用 */
+function makeCommandHandlers(ctx = {}) {
+  return {
+    info: (i) => execute(i, ctx),
+    points: (i) => execute(i, ctx),
+    rank: (i) => execute(i, ctx),
+    counting: (i) => execute(i, ctx),
+    hl: (i) => execute(i, ctx),
+    guess: (i) => execute(i, ctx),
+  };
+}
+
 module.exports = {
-  commandData, // 給 registerCommands() 用
-  getCommand: (name) => ({ execute: (i, ctx) => execute(i, ctx) }), // 相容你 events.js 的取法
-  execute,
+  commandData,          // 給 registerCommands 用
+  execute,              // 可直接呼叫
+  makeCommandHandlers,  // ✅ 給 index.js 用（你現在缺的就是它）
 };
