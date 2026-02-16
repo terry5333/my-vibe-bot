@@ -1,74 +1,90 @@
 "use strict";
 
-const { getTop10Cache, getPoints } = require("../db/points");
+const { getPoints } = require("../db/points");
 const {
-  initConfigListeners,
-  onGuessCommand,
-  onHLCommand,
-  onCountingCommand,
-  onSetupRoleCommand,
-  onWeeklyCommand,
-  onMessageCreate,
-  onButton,
-  syncUser,
+  ensureLeaderboardWarm,
+  getLeaderboardCache,
+  startGuess,
+  handleGuessMessage,
+  startCounting,
+  handleCountingMessage,
+  startHL,
+  handleHLButton,
+  stopChannelGame,
+  upsertProfile,
 } = require("./games");
 
-function isAdminMember(interaction) {
-  return (
-    interaction.inGuild() &&
-    (interaction.memberPermissions?.has?.("Administrator") ||
-      interaction.memberPermissions?.has?.("ManageGuild"))
-  );
-}
-
-function bindEvents(client) {
-  client.once("ready", async () => {
-    await initConfigListeners().catch(() => {});
-  });
-
-  client.on("messageCreate", async (message) => {
-    await onMessageCreate(client, message);
-  });
-
+function bindDiscordEvents(client, webRuntime) {
   client.on("interactionCreate", async (interaction) => {
     try {
-      if (interaction.isChatInputCommand()) {
-        const name = interaction.commandName;
-
-        if (name === "points") {
-          await interaction.deferReply({ ephemeral: true });
-          await syncUser(interaction.user);
-          const pts = await getPoints(interaction.user.id);
-          return interaction.editReply(`💰 你目前積分：**${pts}**`);
+      // Buttons
+      if (interaction.isButton()) {
+        if (interaction.customId.startsWith("hl_")) {
+          return await handleHLButton(interaction);
         }
-
-        if (name === "rank") {
-          const top = getTop10Cache();
-          if (!top.top.length) return interaction.reply("🏆 排行榜目前沒有資料～先玩遊戲拿分吧！");
-          const lines = top.top.map((x, i) => `**#${i + 1}** <@${x.userId}> — **${x.points}**`);
-          const ageSec = Math.floor((Date.now() - top.updatedAt) / 1000);
-          return interaction.reply(`🏆 排行榜（快取秒回）\n${lines.join("\n")}\n\n_快取更新：${ageSec}s 前_`);
-        }
-
-        if (name === "guess") return onGuessCommand(client, interaction);
-        if (name === "hl") return onHLCommand(client, interaction);
-        if (name === "counting") return onCountingCommand(client, interaction);
-        if (name === "setup-role") return onSetupRoleCommand(interaction);
-        if (name === "weekly") return onWeeklyCommand(client, interaction);
+        return;
       }
 
-      if (interaction.isButton()) {
-        return onButton(client, interaction);
+      if (!interaction.isChatInputCommand()) return;
+
+      // ✅ 所有指令都先 defer，避免交互失敗
+      const name = interaction.commandName;
+
+      if (name === "rank") {
+        await interaction.deferReply({ ephemeral: false });
+        await ensureLeaderboardWarm();
+
+        const cache = getLeaderboardCache();
+        if (!cache.items.length) return interaction.editReply("目前沒有排行榜資料。");
+
+        const lines = cache.items.slice(0, 10).map((x, i) => `#${i + 1} <@${x.userId}>：**${x.points}**`);
+        return interaction.editReply(`📊 排行榜 Top 10\n${lines.join("\n")}`);
+      }
+
+      if (name === "points") {
+        await interaction.deferReply({ ephemeral: true });
+        const p = await getPoints(interaction.user.id);
+        await upsertProfile(interaction.user);
+        return interaction.editReply(`⭐ 你的目前積分：**${p}**`);
+      }
+
+      if (name === "guess") {
+        return await startGuess(interaction, webRuntime);
+      }
+
+      if (name === "counting") {
+        return await startCounting(interaction, webRuntime);
+      }
+
+      if (name === "hl") {
+        return await startHL(interaction, webRuntime);
+      }
+
+      if (name === "stop") {
+        return await stopChannelGame(interaction, webRuntime);
       }
     } catch (e) {
-      try {
-        if (interaction.isRepliable()) {
-          if (interaction.deferred || interaction.replied) await interaction.editReply("❌ 發生錯誤，請稍後再試。");
-          else await interaction.reply({ content: "❌ 發生錯誤，請稍後再試。", ephemeral: true });
-        }
-      } catch {}
+      console.error("interaction error:", e);
+      if (interaction.deferred || interaction.replied) {
+        interaction.editReply("❌ 發生錯誤").catch(() => {});
+      } else {
+        interaction.reply({ content: "❌ 發生錯誤", ephemeral: true }).catch(() => {});
+      }
+    }
+  });
+
+  client.on("messageCreate", async (msg) => {
+    try {
+      if (!msg.guild) return;
+      if (msg.author.bot) return;
+
+      // ✅ 文字遊戲監聽（guess + counting）
+      await handleGuessMessage(msg);
+      await handleCountingMessage(msg);
+    } catch (e) {
+      console.error("messageCreate error:", e);
     }
   });
 }
 
-module.exports = { bindEvents };
+module.exports = { bindDiscordEvents };
