@@ -2,13 +2,15 @@
 
 /**
  * src/index.js
- * A 方案：index.js 統一 deferReply()，commands 只能 editReply / followUp
+ * - 單一 interactionCreate handler（避免指令/回覆重複）
+ * - 統一 deferReply({ flags: Ephemeral }) 避免 10062 Unknown interaction
+ * - 真正「要開始」的訊息請在 commands.js 用 channel.send + deleteReply()
  */
 
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const commands = require("./bot/commands"); // commands.js (commandData + execute)
+const commands = require("./bot/commands"); // 你那份 commands.js（commandData + execute）
 const gamesMod = require("./bot/games");    // games.js：module.exports = { games, onMessage }
 
 // ---- env ----
@@ -23,42 +25,30 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // 需要讀取頻道輸入數字（counting/guess）
+    GatewayIntentBits.MessageContent, // counting/guess 需要讀取頻道數字
   ],
   partials: [Partials.Channel],
 });
 
-// ---- bootstrap (Firebase) ----
-// ✅ 兼容三種 export：
-// 1) module.exports = initFirebase
-// 2) module.exports = { initFirebase }
-// 3) exports.default = initFirebase
-let initFirebaseFn = null;
+// ---- firebase (optional) ----
+// 你的 firebase 可能是 module.exports = fn 或 module.exports = { initFirebase }
+// 所以用安全方式處理，避免 "initFirebase is not a function"
 try {
-  const fb = require("./db/firebase"); // 你原本的路徑
-  initFirebaseFn =
+  const fb = require("./db/firebase");
+  const init =
     (typeof fb === "function" && fb) ||
-    (typeof fb?.initFirebase === "function" && fb.initFirebase) ||
-    (typeof fb?.default === "function" && fb.default) ||
-    null;
-} catch (_) {
-  initFirebaseFn = null;
-}
+    (fb && typeof fb.initFirebase === "function" && fb.initFirebase);
 
-if (initFirebaseFn) {
-  try {
-    initFirebaseFn();
-  } catch (e) {
-    console.error("[Firebase] init failed:", e);
-  }
-} else {
-  console.warn("[Firebase] initFirebase not found or not a function (skipped)");
+  if (typeof init === "function") init();
+} catch (_) {
+  // 沒有 firebase 檔或不需要就忽略
 }
 
 // ---- ready ----
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
+  // 註冊 slash commands（建議用 GUILD + 清 GLOBAL）
   try {
     await registerCommands(client);
     console.log("[Commands] registered");
@@ -67,23 +57,23 @@ client.once("ready", async () => {
   }
 });
 
-// ✅ 確保「只」有一個 interactionCreate handler
+// ✅ 確保只註冊一次 interactionCreate
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
-    // 1) 先 ACK：統一 defer（避免 3 秒超時 Unknown interaction 10062）
+    // 先 ACK（ephemeral flags），避免超時 Unknown interaction
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
 
-    // 2) 執行指令（commands.js 裡「不能再 reply()」，只能 editReply/followUp）
+    // 執行指令
     await commands.execute(interaction, { client });
 
   } catch (err) {
     console.error("[interactionCreate] error:", err);
 
-    // 這裡也要用「不會二次 reply」的方式回覆
+    // 只能用 editReply 或 reply（避免 40060 already acknowledged）
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
@@ -97,7 +87,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// counting / guess 要「直接在頻道輸入數字」：messageCreate
+// counting / guess：直接在頻道輸入數字要靠 messageCreate
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
