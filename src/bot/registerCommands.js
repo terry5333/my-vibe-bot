@@ -2,38 +2,49 @@
 
 /**
  * src/bot/registerCommands.js
- * - 只註冊 GUILD 指令
- * - 啟動時清掉 GLOBAL 指令 → 修「指令重複」
+ * ✅ 只註冊一邊：有 DISCORD_GUILD_ID -> 註冊 GUILD（建議）
+ * ✅ 可選清掉 GLOBAL 舊指令（避免「兩份一樣的指令」）
  */
 
 const { REST, Routes } = require("discord.js");
-const commands = require("./commands");
 
-async function registerCommands(client) {
-  const token = process.env.DISCORD_TOKEN;
-  const guildId = process.env.GUILD_ID;
+const adminCommands = require("./commands_admin"); // 這裡拿 commandData
 
-  if (!token) throw new Error("Missing env: DISCORD_TOKEN");
-  if (!guildId) throw new Error("Missing env: GUILD_ID（要用 guild 註冊才能避免指令重複）");
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
+
+async function registerCommands() {
+  const token = requireEnv("DISCORD_TOKEN");
+  const clientId = requireEnv("DISCORD_CLIENT_ID");
+  const guildId = process.env.DISCORD_GUILD_ID;
 
   const rest = new REST({ version: "10" }).setToken(token);
 
-  const appId = client.user.id;
+  const body = adminCommands.commandData; // array of toJSON()
 
-  // 1) 清掉 GLOBAL 指令（避免你看到兩份）
-  try {
-    await rest.put(Routes.applicationCommands(appId), { body: [] });
-    console.log("[Commands] Cleared GLOBAL slash commands");
-  } catch (e) {
-    console.warn("[Commands] Clear GLOBAL failed (can ignore if no global):", e?.message || e);
+  // ✅ 如果你以前註冊過 GLOBAL，Discord 會顯示兩份
+  // 第一次跑建議開 CLEAR_GLOBAL_COMMANDS=true，把 GLOBAL 清掉
+  const clearGlobal = String(process.env.CLEAR_GLOBAL_COMMANDS || "").toLowerCase() === "true";
+  if (clearGlobal) {
+    try {
+      await rest.put(Routes.applicationCommands(clientId), { body: [] });
+      console.log("[Commands] Cleared GLOBAL slash commands");
+    } catch (e) {
+      console.warn("[Commands] Clear GLOBAL failed (ignore if no perms):", e?.message || e);
+    }
   }
 
-  // 2) 註冊 GUILD 指令
-  await rest.put(Routes.applicationGuildCommands(appId, guildId), {
-    body: commands.commandData,
-  });
-
-  console.log("[Commands] Registered GUILD slash commands");
+  if (guildId) {
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body });
+    console.log("[Commands] Registered GUILD slash commands");
+  } else {
+    // 只有你真的想用 GLOBAL 才走這裡（不建議初期，會慢且容易兩份）
+    await rest.put(Routes.applicationCommands(clientId), { body });
+    console.log("[Commands] Registered GLOBAL slash commands");
+  }
 }
 
 module.exports = { registerCommands };
