@@ -2,16 +2,17 @@
 
 /**
  * src/index.js
- * ✅ 只保留 1 個 interactionCreate handler（避免重複回覆）
- * ✅ slash commands 一律 deferReply（避免 Unknown interaction 10062）
- * ✅ 用 flags 取代 ephemeral（避免 deprecated warning）
+ * ✅ 只保留 1 個 interactionCreate handler（避免回覆兩次）
+ * ✅ 处理：slash / button / modal
+ * ✅ ready/clientReady 相容（避免 ready 觸發兩次）
  */
 
-const { Client, GatewayIntentBits, Partials, MessageFlags, Events } = require("discord.js");
+const { Client, GatewayIntentBits, Partials, Events } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const adminCommands = require("./bot/commands_admin"); // 這包先只放 install/points/rank/info
-const gamesMod = require("./bot/games"); // 你原本的 counting/guess/hl message handler 之後會改成按鈕+房間
+const adminCommands = require("./bot/commands_admin");
+const { ensureLobbyPosts, handleLobbyInteraction } = require("./bot/lobbyButtons");
+const { handleCountingMessage, tryCleanupExpiredPunishments } = require("./bot/warnings");
 
 // ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -25,27 +26,22 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // counting 需要讀數字
+    GatewayIntentBits.MessageContent, // counting 需要讀訊息
+    GatewayIntentBits.GuildMembers, // 需要加/移除身份組
+    GatewayIntentBits.DirectMessages, // DM 提醒（需要 partials）
   ],
   partials: [Partials.Channel],
 });
 
-// ---- firebase (可選) ----
-// 你之前炸掉是因為你 require 回來不是 function
-// 這裡做「超保守」相容：module.exports = function / {initFirebase} / {default}
+// ---- firebase (可選) 超保守相容：function / {initFirebase} / {default} ----
 try {
   const fb = require("./db/firebase");
   const initFirebase = fb?.initFirebase || fb?.default || fb;
   if (typeof initFirebase === "function") initFirebase();
-} catch (_) {
-  // 沒有 firebase 也沒關係，不要讓它炸
-}
+} catch (_) {}
 
 let readyOnce = false;
-
-// v14: "ready"；v15+: "clientReady"
-// 我們兩個都掛，但用 readyOnce 防止跑兩次
-client.once(Events.ClientReady ?? "clientReady", async () => {
+async function onReady() {
   if (readyOnce) return;
   readyOnce = true;
 
@@ -57,56 +53,55 @@ client.once(Events.ClientReady ?? "clientReady", async () => {
   } catch (e) {
     console.error("[Commands] register failed:", e);
   }
-});
 
-client.once("ready", async () => {
-  // 保底相容
-  if (readyOnce) return;
-  readyOnce = true;
-
-  console.log(`[Discord] Logged in as ${client.user.tag}`);
-
+  // ✅ 發送大廳按鈕 & 規則查詢按鈕（只會補上，不會一直狂洗）
   try {
-    await registerCommands();
-    console.log("[Commands] registered");
+    await ensureLobbyPosts(client);
   } catch (e) {
-    console.error("[Commands] register failed:", e);
+    console.error("[Lobby] ensure posts failed:", e);
   }
-});
+}
 
-// ✅ 唯一 interactionCreate handler（重點：避免回覆兩次）
+client.once(Events.ClientReady ?? "clientReady", onReady);
+client.once("ready", onReady);
+
+// ✅ 唯一 interactionCreate（所有互動都走這裡）
 client.on(Events.InteractionCreate ?? "interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
   try {
-    // 先 ACK，避免 3 秒超時 Unknown interaction (10062)
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // 1) Slash commands
+    if (interaction.isChatInputCommand()) {
+      await adminCommands.execute(interaction, { client });
+      return;
     }
 
-    // 執行管理指令（install/points/rank/info）
-    await adminCommands.execute(interaction, { client });
+    // 2) Lobby buttons / Room buttons / Modals
+    if (interaction.isButton() || interaction.isModalSubmit()) {
+      await handleLobbyInteraction(interaction, { client });
+      return;
+    }
   } catch (err) {
     console.error("[interactionCreate] error:", err);
-
-    // 只能 editReply（避免 40060 already acknowledged）
+    // 按鈕/Modal 可能沒 defer，這裡盡量不炸
     try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
+      if (interaction.isRepliable()) {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply("❌ 發生錯誤，請再試一次。");
+        } else {
+          await interaction.reply({ content: "❌ 發生錯誤，請再試一次。", ephemeral: true });
+        }
       }
     } catch (_) {}
   }
 });
 
-// counting/guess (你說 counting 大廳要只能數字，後面會做)
-// 先保留你原本 games 的 onMessage
+// counting：只允許數字 + 非數字刪除 + 2次文字 -> ⚠️賤人 3天 / 再犯 -> 永久
 client.on(Events.MessageCreate ?? "messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
+    if (!message.guild) return;
 
-    if (typeof gamesMod?.onMessage === "function") {
-      await gamesMod.onMessage(message, { client });
-    }
+    await tryCleanupExpiredPunishments(message.guild);
+    await handleCountingMessage(message, { client });
   } catch (err) {
     console.error("[messageCreate] error:", err);
   }
