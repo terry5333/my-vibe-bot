@@ -4,12 +4,14 @@
  * src/bot/events.js
  *
  * ✅ 目標：
- * 1) 所有 Slash 指令不要再只回「發生錯誤」而看不到原因 → 一定印出 stack
- * 2) 文字遊戲/訊息事件（messageCreate）不會因為缺檔就整個炸 → safeRequire
- * 3) 不強迫你一定要照我的檔案結構：找不到模組就跳過，但會 console.warn
+ * 1) Slash 指令錯誤要印出 stack（不要只回「發生錯誤」）
+ * 2) games / messageCreate 缺檔不會炸
+ * 3) 支援不同 commands 結構（client.commands / commands.js）
+ * 4) 避免 ephemeral deprecated warning → 用 flags
  */
 
 const path = require("path");
+const { MessageFlags } = require("discord.js");
 
 /* -------------------- Safe require（避免缺檔直接炸掉） -------------------- */
 function safeRequire(p) {
@@ -30,6 +32,66 @@ function safeRequire(p) {
 const commandsMod = safeRequire(path.join(__dirname, "./commands.js"));
 const gamesMod = safeRequire(path.join(__dirname, "./games.js"));
 
+/* -------------------- Helpers -------------------- */
+
+function getCmdFromClient(client, name) {
+  if (!client) return null;
+  // 常見：client.commands 是 Collection
+  if (client.commands?.get) return client.commands.get(name);
+  // 有人會放成一般物件
+  if (client.commands && typeof client.commands === "object") return client.commands[name];
+  return null;
+}
+
+function getCmdFromModule(mod, name) {
+  if (!mod) return null;
+
+  // 1) mod.getCommand(name)
+  if (typeof mod.getCommand === "function") return mod.getCommand(name);
+
+  // 2) mod.commands 是 Collection/Map
+  if (mod.commands?.get) return mod.commands.get(name);
+
+  // 3) mod[name]
+  if (mod[name]) return mod[name];
+
+  // 4) mod.commands 是一般物件
+  if (mod.commands && typeof mod.commands === "object") return mod.commands[name];
+
+  return null;
+}
+
+async function safeReply(interaction, payload) {
+  // payload 可以是 { content, flags } 或 string
+  const data = typeof payload === "string" ? { content: payload } : payload;
+
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(data);
+    }
+    return await interaction.reply(data);
+  } catch (e) {
+    console.error("❌ [Slash] safeReply failed:", e);
+    return null;
+  }
+}
+
+function logInteractionContext(interaction) {
+  try {
+    const guild = interaction.guild?.name || "DM/UnknownGuild";
+    const gid = interaction.guildId || "N/A";
+    const cid = interaction.channelId || "N/A";
+    const user = interaction.user?.tag || interaction.user?.id || "N/A";
+    console.error(
+      `🧾 Context: guild=${guild}(${gid}) channel=${cid} user=${user} cmd=/${interaction.commandName}`
+    );
+  } catch {
+    // ignore
+  }
+}
+
+/* -------------------- Main binder -------------------- */
+
 /**
  * ✅ 綁定 Discord 事件
  * @param {import("discord.js").Client} client
@@ -40,81 +102,62 @@ function bindDiscordEvents(client, webRuntime) {
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    const name = interaction.commandName;
+
     try {
-      // 1) 嘗試從 client.commands（最常見）取
-      let cmd =
-        client.commands?.get?.(interaction.commandName) ||
-        client.commands?.[interaction.commandName];
+      // 1) client.commands
+      let cmd = getCmdFromClient(client, name);
 
-      // 2) 如果你是把 commands 放在 commands.js 裡
-      if (!cmd && commandsMod) {
-        // 支援：commandsMod.getCommand(name) 或 commandsMod.commands(Map)
-        if (typeof commandsMod.getCommand === "function") {
-          cmd = commandsMod.getCommand(interaction.commandName);
-        } else if (commandsMod.commands?.get) {
-          cmd = commandsMod.commands.get(interaction.commandName);
-        } else if (commandsMod[interaction.commandName]) {
-          cmd = commandsMod[interaction.commandName];
-        }
-      }
+      // 2) commands.js module
+      if (!cmd) cmd = getCmdFromModule(commandsMod, name);
 
-      if (!cmd || typeof cmd.execute !== "function") {
-        return interaction.reply({
-          content: `❌ 找不到指令處理器：/${interaction.commandName}\n（可能尚未註冊或 commands 載入失敗）`,
-          ephemeral: true,
+      // cmd 可能長這樣：
+      // - { execute(interaction, ctx) }
+      // - function(interaction, ctx)
+      const exec =
+        typeof cmd === "function"
+          ? cmd
+          : cmd && typeof cmd.execute === "function"
+          ? cmd.execute.bind(cmd)
+          : null;
+
+      if (!exec) {
+        return safeReply(interaction, {
+          content: `❌ 找不到指令處理器：/${name}\n（可能尚未註冊或 commands 載入失敗）`,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
-      // 避免 Discord 3 秒超時：先 defer
+      // 避免 3 秒超時：先 defer（公開回覆）
       if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: false });
+        await interaction.deferReply(); // 不用 ephemeral，避免 deprecated
       }
 
-      // 統一把 runtime 傳進去（你想用就用，不想用可忽略）
-      await cmd.execute(interaction, { client, webRuntime });
+      await exec(interaction, { client, webRuntime });
     } catch (err) {
-      // ✅ 這行是關鍵：把真正錯誤印出來（你才知道到底哪裡炸）
-      console.error(`❌ [Slash] /${interaction.commandName} Error:`, err);
+      console.error(`❌ [Slash] /${name} Error:`, err);
+      logInteractionContext(interaction);
 
-      // 回覆使用者（避免 bot 直接掛）
-      const msg = "❌ 發生錯誤（已記錄到伺服器 log）";
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply(msg);
-        } else {
-          await interaction.reply({ content: msg, ephemeral: true });
-        }
-      } catch (e2) {
-        console.error("❌ [Slash] 回覆錯誤訊息也失敗：", e2);
-      }
+      // 使用者看到的訊息（避免噴一堆 stack）
+      await safeReply(interaction, "❌ 發生錯誤（已記錄到伺服器 log）");
     }
   });
 
   // ---------- 訊息事件（文字遊戲會用到） ----------
   client.on("messageCreate", async (message) => {
     try {
-      // 忽略 bot 自己/其他 bot
       if (!message || message.author?.bot) return;
+      if (!message.guild) return; // 只處理 guild
 
-      // 只在 guild 訊息處理（你想支援 DM 可移除）
-      if (!message.guild) return;
-
-      // 如果你沒有 games.js 就跳過
       if (!gamesMod) return;
 
-      /**
-       * games.js 建議提供：
-       * - onMessage(message, { client, webRuntime })
-       * 或
-       * - handleMessage(message, { client, webRuntime })
-       */
+      // games.js 建議提供 onMessage / handleMessage
       if (typeof gamesMod.onMessage === "function") {
         await gamesMod.onMessage(message, { client, webRuntime });
       } else if (typeof gamesMod.handleMessage === "function") {
         await gamesMod.handleMessage(message, { client, webRuntime });
       }
     } catch (err) {
-      // 不要讓 messageCreate 的錯誤把整個 bot 搞掛
       console.error("❌ [Message] Error:", err);
     }
   });
@@ -124,7 +167,7 @@ function bindDiscordEvents(client, webRuntime) {
     console.log("[Discord] Ready:", client.user?.tag);
   });
 
-  // ---------- 其他：把未處理錯誤都印出來 ----------
+  // ---------- 未處理錯誤全部印出來 ----------
   process.on("unhandledRejection", (reason) => {
     console.error("❌ unhandledRejection:", reason);
   });
