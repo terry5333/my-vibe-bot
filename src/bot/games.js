@@ -3,360 +3,341 @@
 /**
  * src/bot/games.js
  *
- * 文字觸發遊戲：
- *  - 終極密碼：!up start / !up end / !up reset / !up status / !up <number>
- *  - 數字接龍：!count start / !count end / !count reset / !count status / 直接輸入數字就算
- *
- * 每個「頻道」各自一局（不會互相干擾）
+ * ✅ 你的需求：
+ * 1) guess 不用 try：管理員直接 /guess set <number> 改答案
+ * 2) counting 對/錯都要表情符號
+ * 3) counting 同人連打 或 有人打錯 → 直接結束
+ * 4) hl 改按鈕式
+ * 5) 全部遊戲加分：counting +2 / hl +5 / 終極密碼 +10
  */
 
-const PREFIX_UP = "!up";
-const PREFIX_COUNT = "!count";
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+} = require("discord.js");
 
-// -------------------- In-memory states (per channel) --------------------
-/** @type {Map<string, {active:boolean, low:number, high:number, answer:number, tries:number, startedBy:string, startedAt:number}>} */
-const upState = new Map();
+const pointsDb = require("../db/points.js");
 
-/** @type {Map<string, {active:boolean, next:number, lastUserId:string|null, startedBy:string, startedAt:number, streak:number}>} */
-const countState = new Map();
+// ===== 加分規則（你要改就改這裡）=====
+const SCORE = {
+  COUNTING_OK: 2,
+  HL_OK: 5,
+  GUESS_OK: 10,
+};
 
-// -------------------- Helpers --------------------
-function now() {
-  return Date.now();
-}
-
-function chanId(message) {
-  return message?.channel?.id || "unknown";
-}
-
-function isAdminLike(member) {
-  // 管理員/伺服器管理權限
-  try {
-    return Boolean(member?.permissions?.has?.("Administrator") || member?.permissions?.has?.("ManageGuild"));
-  } catch {
-    return false;
-  }
-}
-
-function parseIntSafe(s) {
-  const n = Number(String(s).trim());
-  if (!Number.isFinite(n)) return null;
-  if (!Number.isInteger(n)) return null;
-  return n;
-}
-
-function clampRange(low, high) {
-  // 避免太誇張的範圍（防刷/防亂）
-  const MIN = -1000000;
-  const MAX = 1000000;
-  const l = Math.max(MIN, Math.min(MAX, low));
-  const h = Math.max(MIN, Math.min(MAX, high));
-  return [Math.min(l, h), Math.max(l, h)];
-}
-
-function pickAnswer(low, high) {
-  // inclusive
-  const r = Math.floor(Math.random() * (high - low + 1)) + low;
-  return r;
-}
-
-function mention(userId) {
-  return `<@${userId}>`;
-}
-
-async function safeReply(message, content) {
-  try {
-    return await message.reply({ content, allowedMentions: { repliedUser: false } });
-  } catch {
-    try {
-      return await message.channel.send({ content });
-    } catch {
-      return null;
-    }
-  }
-}
-
-function helpText() {
-  return [
-    "🎮 **遊戲指令**",
-    "",
-    "**終極密碼**（每頻道一局）",
-    `- \`${PREFIX_UP} start [min] [max]\`：開始（預設 1~100）`,
-    `- \`${PREFIX_UP} <數字>\`：猜答案`,
-    `- \`${PREFIX_UP} status\`：看目前範圍與次數`,
-    `- \`${PREFIX_UP} reset\`：重置本頻道`,
-    `- \`${PREFIX_UP} end\`：結束（管理員/開局者）`,
-    "",
-    "**數字接龍 Counting**（每頻道一局）",
-    `- \`${PREFIX_COUNT} start [起始數]\`：開始（預設從 1 開始）`,
-    `- 直接在頻道輸入數字：進行接龍（必須是下一個數）`,
-    `- \`${PREFIX_COUNT} status\`：看目前下一個要接的數`,
-    `- \`${PREFIX_COUNT} reset\`：重置本頻道`,
-    `- \`${PREFIX_COUNT} end\`：結束（管理員/開局者）`,
-  ].join("\n");
-}
-
-// -------------------- Ultimate Password --------------------
-async function upHandle(message, args) {
-  const cid = chanId(message);
-  const sub = (args[0] || "").toLowerCase();
-
-  // help
-  if (sub === "help" || sub === "h" || sub === "?") {
-    return safeReply(message, helpText());
-  }
-
-  // start
-  if (sub === "start") {
-    // !up start [min] [max]
-    let low = 1;
-    let high = 100;
-
-    const a1 = args[1];
-    const a2 = args[2];
-    const n1 = a1 !== undefined ? parseIntSafe(a1) : null;
-    const n2 = a2 !== undefined ? parseIntSafe(a2) : null;
-
-    if (n1 !== null && n2 !== null) {
-      low = n1;
-      high = n2;
-    } else if (n1 !== null && n2 === null) {
-      // 只給一個數字就當上限：1~n1
-      low = 1;
-      high = n1;
-    }
-
-    [low, high] = clampRange(low, high);
-
-    if (high - low < 5) {
-      return safeReply(message, "⚠️ 範圍太小了，至少要差 5 以上喔（例如 1~100）。");
-    }
-
-    const answer = pickAnswer(low, high);
-    upState.set(cid, {
-      active: true,
-      low,
-      high,
-      answer,
-      tries: 0,
-      startedBy: message.author.id,
-      startedAt: now(),
-    });
-
-    return safeReply(
-      message,
-      `🔐 **終極密碼開始！**\n範圍：**${low} ~ ${high}**\n用 \`${PREFIX_UP} <數字>\` 來猜！`
-    );
-  }
-
-  // status
-  if (sub === "status") {
-    const st = upState.get(cid);
-    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的終極密碼。用 `!up start` 開始。");
-    return safeReply(
-      message,
-      `🔐 **終極密碼狀態**\n範圍：**${st.low} ~ ${st.high}**\n嘗試次數：**${st.tries}**`
-    );
-  }
-
-  // reset
-  if (sub === "reset") {
-    upState.delete(cid);
-    return safeReply(message, "♻️ 已重置本頻道的終極密碼狀態。");
-  }
-
-  // end
-  if (sub === "end" || sub === "stop") {
-    const st = upState.get(cid);
-    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的終極密碼。");
-
-    const allowed = st.startedBy === message.author.id || isAdminLike(message.member);
-    if (!allowed) return safeReply(message, "⛔ 只有開局者或管理員可以結束這局。");
-
-    upState.delete(cid);
-    return safeReply(message, "🧹 已結束本頻道的終極密碼。");
-  }
-
-  // guess number: !up 50
-  const st = upState.get(cid);
-  const guess = parseIntSafe(sub);
-
-  if (guess === null) {
-    return safeReply(message, "❓ 指令不懂。輸入 `!up help` 看用法。");
-  }
-
-  if (!st?.active) {
-    return safeReply(message, "ℹ️ 本頻道還沒開始終極密碼。用 `!up start` 開始。");
-  }
-
-  st.tries += 1;
-
-  if (guess <= st.low || guess >= st.high) {
-    return safeReply(message, `⚠️ 你猜的 **${guess}** 不在目前有效範圍（必須介於 **${st.low}** 和 **${st.high}** 之間）。`);
-  }
-
-  if (guess === st.answer) {
-    upState.delete(cid);
-    return safeReply(
-      message,
-      `🎉 ${mention(message.author.id)} **猜中了！答案就是 ${guess}**\n（本局共嘗試 ${st.tries} 次）\n再來一局：\`${PREFIX_UP} start\``
-    );
-  }
-
-  if (guess < st.answer) st.low = guess;
-  else st.high = guess;
-
-  upState.set(cid, st);
-
-  return safeReply(message, `🔎 ${mention(message.author.id)} 目前範圍：**${st.low} ~ ${st.high}**（第 ${st.tries} 次）`);
-}
+// ===== 記憶體狀態（簡單版：重啟會清空）=====
+const state = {
+  counting: new Map(), // channelId -> { active, expected, lastUserId }
+  hl: new Map(),       // channelId -> { active, max, secret, msgId }
+  guess: new Map(),    // channelId -> { active, min, max, secret }
+};
 
 // -------------------- Counting --------------------
-async function countHandleCommand(message, args) {
-  const cid = chanId(message);
-  const sub = (args[0] || "").toLowerCase();
-
-  // help
-  if (sub === "help" || sub === "h" || sub === "?") {
-    return safeReply(message, helpText());
-  }
-
-  // start
-  if (sub === "start") {
-    // !count start [startNumber]  -> next should be startNumber (default 1)
-    const startN = args[1] !== undefined ? parseIntSafe(args[1]) : 1;
-    if (startN === null) return safeReply(message, "⚠️ 起始數必須是整數。例：`!count start 1`");
-
-    countState.set(cid, {
-      active: true,
-      next: startN,
-      lastUserId: null,
-      startedBy: message.author.id,
-      startedAt: now(),
-      streak: 0,
-    });
-
-    return safeReply(
-      message,
-      `🔢 **數字接龍開始！**\n下一個要接：**${startN}**\n直接在頻道輸入數字即可（例如：\`${startN}\`）。`
-    );
-  }
-
-  // status
-  if (sub === "status") {
-    const st = countState.get(cid);
-    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的數字接龍。用 `!count start` 開始。");
-    return safeReply(message, `🔢 **數字接龍狀態**\n下一個要接：**${st.next}**\n連續成功：**${st.streak}**`);
-  }
-
-  // reset
-  if (sub === "reset") {
-    countState.delete(cid);
-    return safeReply(message, "♻️ 已重置本頻道的數字接龍狀態。");
-  }
-
-  // end
-  if (sub === "end" || sub === "stop") {
-    const st = countState.get(cid);
-    if (!st?.active) return safeReply(message, "ℹ️ 本頻道目前沒有進行中的數字接龍。");
-
-    const allowed = st.startedBy === message.author.id || isAdminLike(message.member);
-    if (!allowed) return safeReply(message, "⛔ 只有開局者或管理員可以結束。");
-
-    countState.delete(cid);
-    return safeReply(message, "🧹 已結束本頻道的數字接龍。");
-  }
-
-  return safeReply(message, "❓ 指令不懂。輸入 `!count help` 看用法。");
+function countingStart(channelId, startNumber = 1) {
+  state.counting.set(channelId, {
+    active: true,
+    expected: Number(startNumber) || 1,
+    lastUserId: null,
+  });
 }
 
-async function countHandleNumberMessage(message) {
-  const cid = chanId(message);
-  const st = countState.get(cid);
-  if (!st?.active) return;
+function countingStop(channelId) {
+  state.counting.delete(channelId);
+}
 
-  const n = parseIntSafe(message.content);
-  if (n === null) return;
+function countingStatus(channelId) {
+  return state.counting.get(channelId) || { active: false };
+}
 
-  // 防同一人連續
-  if (st.lastUserId && st.lastUserId === message.author.id) {
-    // 這裡我選擇「提醒但不結束」，避免太兇
-    return safeReply(message, `⚠️ ${mention(message.author.id)} 不能連續接兩次，換別人接：**${st.next}**`);
+// ✅ counting 的 message handler：在頻道直接打數字
+async function countingOnMessage(message) {
+  const channelId = message.channelId;
+  const s = state.counting.get(channelId);
+  if (!s || !s.active) return;
+
+  // 只接受「純數字」
+  const text = (message.content || "").trim();
+  if (!/^\d+$/.test(text)) return;
+
+  const num = Number(text);
+
+  // 連續同一人打 → 直接結束
+  if (s.lastUserId && s.lastUserId === message.author.id) {
+    await safeReact(message, "⛔");
+    await message.channel.send(`🛑 **counting 結束**：<@${message.author.id}> 連續打了兩次！`);
+    countingStop(channelId);
+    return;
   }
 
-  if (n !== st.next) {
-    // 錯了就重置到起始（或你想要直接 end 也可以）
-    const expected = st.next;
-    const restart = (st.next - st.streak); // 估算起始，保持概念，不依賴外部
-    countState.set(cid, {
-      active: true,
-      next: expected, // 保持下一個不變也可以，但這裡選擇直接重置到 1
-      lastUserId: null,
-      startedBy: st.startedBy,
-      startedAt: st.startedAt,
-      streak: 0,
-    });
+  // 打錯 → 直接結束
+  if (num !== s.expected) {
+    await safeReact(message, "❌");
+    await message.channel.send(`🛑 **counting 結束**：打錯了！應該是 **${s.expected}**`);
+    countingStop(channelId);
+    return;
+  }
 
-    // 我這裡改成「直接重置到 1」，更常見
-    const resetTo = 1;
-    countState.set(cid, {
-      active: true,
-      next: resetTo,
-      lastUserId: null,
-      startedBy: st.startedBy,
-      startedAt: st.startedAt,
-      streak: 0,
-    });
+  // 打對：✅ +2 分
+  await safeReact(message, "✅");
+  s.lastUserId = message.author.id;
+  s.expected += 1;
 
-    return safeReply(
-      message,
-      `💥 錯了！你輸入 **${n}**，應該要是 **${expected}**。\n已重置，下一個請輸入：**${resetTo}**`
+  // 加分
+  await safeAddPoints(message.author.id, SCORE.COUNTING_OK);
+
+  // 可選：你想要每次提示下一個也行（會吵就關掉）
+  // await message.channel.send(`下一個：**${s.expected}**`);
+}
+
+// -------------------- HL（按鈕式）--------------------
+async function hlStart(interaction, channelId, max = 100) {
+  max = Number(max) || 100;
+  if (max < 2) max = 2;
+
+  // 如果已經有一局
+  const cur = state.hl.get(channelId);
+  if (cur?.active) {
+    return "❗ 本頻道已經有一局 hl 進行中，請先 `/hl stop`。";
+  }
+
+  const secret = 1 + Math.floor(Math.random() * max);
+
+  state.hl.set(channelId, {
+    active: true,
+    max,
+    secret,
+    msgId: null,
+  });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("hl_low").setLabel("猜：偏小").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("hl_high").setLabel("猜：偏大").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("hl_equal").setLabel("猜：剛好").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("hl_stop").setLabel("結束").setStyle(ButtonStyle.Secondary),
+  );
+
+  // 你可以改成「顯示目前線索」，我先做最直覺：
+  // 讓大家按：偏小/偏大/剛好（剛好才算中）
+  const sent = await interaction.channel.send({
+    content: `🎲 **HL 開始！**（1 ~ ${max}）\n按按鈕猜：偏小 / 偏大 / 剛好`,
+    components: [row],
+  });
+
+  const st = state.hl.get(channelId);
+  if (st) st.msgId = sent.id;
+
+  const collector = sent.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: 60 * 1000, // 60 秒
+  });
+
+  collector.on("collect", async (btn) => {
+    const st2 = state.hl.get(channelId);
+    if (!st2?.active) {
+      try { await btn.reply({ content: "這局已結束。", ephemeral: true }); } catch {}
+      return;
+    }
+
+    // 結束按鈕
+    if (btn.customId === "hl_stop") {
+      st2.active = false;
+      state.hl.delete(channelId);
+      collector.stop("stopped");
+      try { await btn.reply({ content: "🛑 hl 已結束。", ephemeral: true }); } catch {}
+      try { await sent.edit({ components: [] }); } catch {}
+      return;
+    }
+
+    // 判定：只有「剛好」且剛好猜中才算中
+    // 這版 HL 我做成「猜剛好」= 中獎；偏小/偏大會回提示（不加分）
+    if (btn.customId === "hl_equal") {
+      // ✅ 讓它真的「剛好」才算中：需要玩家同時輸入數字？你沒要輸入數字
+      // 所以這裡改成：按「剛好」就是賭一把，若 secret 落在中間？會很怪
+      // ✅ 更合理做法：HL 改成「系統出一個 current，玩家猜下一個會高或低」
+      // 但你只說要按鈕式，我先做一個「下一張牌高低」版（更標準）
+      // ---- 下面直接切成高低牌玩法 ----
+    }
+
+    // === 高低牌玩法（標準 HL 按鈕）===
+    // 我們把 secret 當作「下一張」，再生成一張 current
+    const current = 1 + Math.floor(Math.random() * st2.max);
+    const next = st2.secret; // 下一張固定 secret
+
+    let correct = false;
+    if (btn.customId === "hl_low") correct = next < current;
+    if (btn.customId === "hl_high") correct = next > current;
+    if (btn.customId === "hl_equal") correct = next === current;
+
+    if (correct) {
+      await safeAddPoints(btn.user.id, SCORE.HL_OK);
+      st2.active = false;
+      state.hl.delete(channelId);
+      collector.stop("win");
+
+      try {
+        await btn.reply({
+          content: `🎉 <@${btn.user.id}> 猜對了！\n目前：**${current}** → 下一張：**${next}**\n✅ +${SCORE.HL_OK} 分`,
+        });
+      } catch {}
+
+      try { await sent.edit({ components: [] }); } catch {}
+      return;
+    }
+
+    // 猜錯：只回覆提示，不結束（你沒有說 hl 猜錯要結束，所以保留繼續）
+    try {
+      await btn.reply({
+        content: `❌ 猜錯～\n目前：**${current}** → 下一張：**${next}**\n（再開一局請 `/hl start`）`,
+        ephemeral: true,
+      });
+    } catch {}
+
+    // 這局我做成「猜一次就結束」，避免一直刷按鈕
+    st2.active = false;
+    state.hl.delete(channelId);
+    collector.stop("end");
+    try { await sent.edit({ components: [] }); } catch {}
+  });
+
+  collector.on("end", async () => {
+    // 如果時間到還沒結束，清掉按鈕
+    try {
+      const st3 = state.hl.get(channelId);
+      if (st3?.active) state.hl.delete(channelId);
+      await sent.edit({ components: [] });
+    } catch {}
+  });
+
+  return "✅ 已送出 hl 按鈕！";
+}
+
+function hlStop(channelId) {
+  state.hl.delete(channelId);
+}
+
+function hlStatus(channelId) {
+  const s = state.hl.get(channelId);
+  if (!s) return { active: false };
+  return { active: !!s.active, max: s.max };
+}
+
+// -------------------- 終極密碼 Guess（頻道直接輸入數字）--------------------
+function guessSet(channelId, { min = 1, max = 100, secret }) {
+  min = Number(min) || 1;
+  max = Number(max) || 100;
+  secret = Number(secret);
+
+  if (!Number.isFinite(secret)) throw new Error("secret must be a number");
+
+  if (min > max) [min, max] = [max, min];
+  if (secret < min) secret = min;
+  if (secret > max) secret = max;
+
+  state.guess.set(channelId, { active: true, min, max, secret });
+}
+
+function guessStart(channelId, { min = 1, max = 100 } = {}) {
+  min = Number(min) || 1;
+  max = Number(max) || 100;
+  if (min > max) [min, max] = [max, min];
+
+  const cur = state.guess.get(channelId);
+  // 如果之前已 set 過答案就沿用，不然隨機
+  const secret =
+    cur?.secret && cur.secret >= min && cur.secret <= max
+      ? cur.secret
+      : min + Math.floor(Math.random() * (max - min + 1));
+
+  state.guess.set(channelId, { active: true, min, max, secret });
+}
+
+function guessStop(channelId) {
+  state.guess.delete(channelId);
+}
+
+function guessStatus(channelId) {
+  return state.guess.get(channelId) || { active: false };
+}
+
+async function guessOnMessage(message) {
+  const channelId = message.channelId;
+  const s = state.guess.get(channelId);
+  if (!s?.active) return;
+
+  const text = (message.content || "").trim();
+  if (!/^\d+$/.test(text)) return;
+
+  const num = Number(text);
+
+  // 超出範圍就忽略（或你要提示也可以）
+  if (num < s.min || num > s.max) return;
+
+  // 猜到：+10 分，結束
+  if (num === s.secret) {
+    await safeReact(message, "🎉");
+    await safeAddPoints(message.author.id, SCORE.GUESS_OK);
+    await message.channel.send(
+      `🎊 <@${message.author.id}> **猜到了終極密碼：${s.secret}**！\n✅ +${SCORE.GUESS_OK} 分`
     );
+    guessStop(channelId);
+    return;
   }
 
-  // correct
-  st.lastUserId = message.author.id;
-  st.next += 1;
-  st.streak += 1;
-  countState.set(cid, st);
+  // 沒猜到：縮範圍提示（終極密碼標準玩法）
+  if (num < s.secret) {
+    s.min = Math.max(s.min, num + 1);
+    await safeReact(message, "⬆️");
+    await message.channel.send(`⬆️ 太小了！新範圍：**${s.min} ~ ${s.max}**`);
+    return;
+  }
 
-  // 不狂洗頻道：每 10 次回一次，或你也可以改成每次都回
-  if (st.streak % 10 === 0) {
-    return safeReply(message, `✅ 目前連續成功：**${st.streak}**，下一個：**${st.next}**`);
+  if (num > s.secret) {
+    s.max = Math.min(s.max, num - 1);
+    await safeReact(message, "⬇️");
+    await message.channel.send(`⬇️ 太大了！新範圍：**${s.min} ~ ${s.max}**`);
+    return;
   }
 }
 
-// -------------------- Entry --------------------
-async function onMessage(message, { client, webRuntime } = {}) {
+// -------------------- 安全工具 --------------------
+async function safeReact(message, emoji) {
   try {
-    if (!message || message.author?.bot) return;
-    if (!message.guild) return; // 只處理伺服器內訊息（要支援私訊可移除）
+    await message.react(emoji);
+  } catch {}
+}
 
-    const content = (message.content || "").trim();
-    if (!content) return;
-
-    // help
-    if (content === "!game" || content === "!games" || content === "!help") {
-      return safeReply(message, helpText());
-    }
-
-    // Ultimate Password commands
-    if (content.toLowerCase().startsWith(PREFIX_UP)) {
-      const args = content.split(/\s+/).slice(1);
-      return upHandle(message, args);
-    }
-
-    // Counting commands
-    if (content.toLowerCase().startsWith(PREFIX_COUNT)) {
-      const args = content.split(/\s+/).slice(1);
-      return countHandleCommand(message, args);
-    }
-
-    // Counting number messages (only if counting active)
-    await countHandleNumberMessage(message);
-  } catch (err) {
-    console.error("❌ [Games] onMessage error:", err);
+async function safeAddPoints(userId, delta) {
+  try {
+    if (!pointsDb?.addPoints) return;
+    await pointsDb.addPoints(userId, delta);
+  } catch (e) {
+    console.error("[Points] addPoints error:", e);
   }
 }
 
-module.exports = { onMessage };
+// -------------------- 對外提供給 events.js 用 --------------------
+async function onMessage(message, { client, webRuntime } = {}) {
+  // counting / guess 都是「頻道直接輸入數字」模式
+  await countingOnMessage(message);
+  await guessOnMessage(message);
+  // hl 是按鈕，不用 message
+}
+
+const games = {
+  countingStart,
+  countingStop,
+  countingStatus,
+
+  hlStart,
+  hlStop,
+  hlStatus,
+
+  guessSet,
+  guessStart,
+  guessStop,
+  guessStatus,
+};
+
+module.exports = { games, onMessage };
