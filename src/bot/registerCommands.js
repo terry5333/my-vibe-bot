@@ -2,38 +2,42 @@
 
 /**
  * src/bot/registerCommands.js
- * 需要環境變數：
- * - DISCORD_TOKEN (Bot token)
- * - DISCORD_CLIENT_ID (Application ID)
+ * ✅ 只註冊「Guild」指令，避免 Global + Guild 重複出現
+ * ✅ 用 client.token（避免 REST 沒 token）
  *
- * 可選：
- * - DISCORD_GUILD_ID (如果你要用 guild 指令，立刻生效)
+ * 需要 env:
+ * - DISCORD_GUILD_ID
  */
 
 const { REST, Routes } = require("discord.js");
+const commands = require("./commands"); // exports.commandData
 
-async function registerCommands(commandData) {
-  const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.DISCORD_CLIENT_ID;
-  const guildId = process.env.DISCORD_GUILD_ID; // 可選（建議你先用 guild 立刻生效）
+async function registerCommands(client) {
+  const guildId = process.env.DISCORD_GUILD_ID;
+  if (!guildId) {
+    throw new Error("Missing env: DISCORD_GUILD_ID (只註冊 guild 指令需要它)");
+  }
 
-  if (!token) throw new Error("Missing env DISCORD_TOKEN");
-  if (!clientId) throw new Error("Missing env DISCORD_CLIENT_ID");
+  if (!client?.application?.id) {
+    throw new Error("client.application.id not ready (請在 ready 事件後呼叫 registerCommands)");
+  }
+
+  // ✅ token 來源：client.token（login 成功後會有）
+  const token = client.token || process.env.DISCORD_TOKEN;
+  if (!token) {
+    throw new Error("Missing Discord token (client.token / DISCORD_TOKEN)");
+  }
 
   const rest = new REST({ version: "10" }).setToken(token);
 
-  // ✅ 建議：有填 DISCORD_GUILD_ID 就走 guild（秒更新）
-  if (guildId) {
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
-      body: commandData,
-    });
-    console.log("[Commands] Registered GUILD slash commands");
-    return;
-  }
+  const body = Array.isArray(commands.commandData) ? commands.commandData : [];
 
-  // 沒填 guildId 才註冊 global（會有快取延遲）
-  await rest.put(Routes.applicationCommands(clientId), { body: commandData });
-  console.log("[Commands] Registered GLOBAL slash commands");
+  // 註冊到 guild（立即生效）
+  await rest.put(Routes.applicationGuildCommands(client.application.id, guildId), {
+    body,
+  });
+
+  console.log("[Commands] Registered GUILD slash commands");
 }
 
 module.exports = { registerCommands };
