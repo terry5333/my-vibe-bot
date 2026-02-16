@@ -2,7 +2,8 @@
 
 /**
  * ✅ 只註冊 GUILD（避免指令兩份）
- * ✅ 可選清掉 GLOBAL（第一次跑建議 CLEAR_GLOBAL_COMMANDS=true）
+ * ✅ 可選清掉 GLOBAL：第一次修指令重複時用
+ *    設定環境變數：CLEAR_GLOBAL_COMMANDS=true
  */
 
 const { REST, Routes } = require("discord.js");
@@ -22,7 +23,9 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(token);
   const body = adminCommands.commandData;
 
-  const clearGlobal = String(process.env.CLEAR_GLOBAL_COMMANDS || "").toLowerCase() === "true";
+  const clearGlobal =
+    String(process.env.CLEAR_GLOBAL_COMMANDS || "").toLowerCase() === "true";
+
   if (clearGlobal) {
     try {
       await rest.put(Routes.applicationCommands(clientId), { body: [] });
