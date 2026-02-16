@@ -1,266 +1,256 @@
 "use strict";
 
-const { REST, Routes, SlashCommandBuilder } = require("discord.js");
-const pointsDb = require("../db/points");
-const state = require("./state");
-
 /**
- * ⚠️ 你要在 ENV 放：
- * DISCORD_TOKEN
- * CLIENT_ID
- * (可選) GUILD_ID  -> 有填就「秒生效」，沒填就是 GLOBAL 可能要等幾分鐘
+ * src/bot/commands.js
+ *
+ * 提供：
+ * - getSlashCommandData()  給 registerCommands() 用來註冊全部 slash
+ * - getCommand(name)       給 events.js 取 execute handler
  */
 
-function buildCommands() {
-  const cmds = [];
+const {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+} = require("discord.js");
 
-  // /info
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("info")
-      .setDescription("查看機器人資訊與狀態")
-  );
+const pointsDb = require("../db/points.js");
+const { games } = require("./games.js");
 
-  // /points
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("points")
-      .setDescription("查看某人的分數（預設自己）")
-      .addUserOption((o) => o.setName("user").setDescription("要查誰").setRequired(false))
-  );
+// ===== Slash 定義 =====
+const slashData = [
+  new SlashCommandBuilder()
+    .setName("info")
+    .setDescription("顯示遊戲指令與規則"),
 
-  // /rank
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("rank")
-      .setDescription("查看排行榜（Top 20）")
-  );
+  new SlashCommandBuilder()
+    .setName("points")
+    .setDescription("查看自己的分數"),
 
-  // /guess
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("guess")
-      .setDescription("終極密碼：開始/猜/停止")
-      .addSubcommand((s) =>
-        s
-          .setName("start")
-          .setDescription("開始終極密碼（預設 1~100）")
-          .addIntegerOption((o) => o.setName("min").setDescription("最小值").setRequired(false))
-          .addIntegerOption((o) => o.setName("max").setDescription("最大值").setRequired(false))
-      )
-      .addSubcommand((s) =>
-        s
-          .setName("try")
-          .setDescription("猜數字")
-          .addIntegerOption((o) => o.setName("n").setDescription("你猜的數字").setRequired(true))
-      )
-      .addSubcommand((s) => s.setName("stop").setDescription("停止終極密碼"))
-  );
+  new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("查看排行榜（前 20 名）"),
 
-  // /hl
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("hl")
-      .setDescription("High/Low：開始/猜/停止（簡化牌 1~13）")
-      .addSubcommand((s) => s.setName("start").setDescription("開始 High/Low"))
-      .addSubcommand((s) =>
-        s
-          .setName("pick")
-          .setDescription("猜下一張是高還是低")
-          .addStringOption((o) =>
-            o
-              .setName("choice")
-              .setDescription("high 或 low")
-              .setRequired(true)
-              .addChoices(
-                { name: "高 (high)", value: "high" },
-                { name: "低 (low)", value: "low" }
-              )
-          )
-      )
-      .addSubcommand((s) => s.setName("stop").setDescription("停止 High/Low"))
-  );
+  new SlashCommandBuilder()
+    .setName("counting")
+    .setDescription("數字接龍（在頻道直接打數字）")
+    .addSubcommand((s) =>
+      s.setName("start").setDescription("開始本頻道的 counting")
+        .addIntegerOption((o) =>
+          o.setName("start_number")
+            .setDescription("起始數字（預設 1）")
+            .setRequired(false)
+        )
+    )
+    .addSubcommand((s) =>
+      s.setName("stop").setDescription("停止本頻道的 counting")
+    )
+    .addSubcommand((s) =>
+      s.setName("status").setDescription("查看本頻道 counting 狀態")
+    ),
 
-  // /counting
-  cmds.push(
-    new SlashCommandBuilder()
-      .setName("counting")
-      .setDescription("數字接龍：開始/停止/狀態")
-      .addSubcommand((s) => s.setName("start").setDescription("開始數字接龍（訊息打 1、2、3...）"))
-      .addSubcommand((s) => s.setName("stop").setDescription("停止數字接龍"))
-      .addSubcommand((s) => s.setName("status").setDescription("查看數字接龍狀態"))
-  );
+  new SlashCommandBuilder()
+    .setName("hl")
+    .setDescription("高低（按鈕版）")
+    .addSubcommand((s) =>
+      s.setName("start").setDescription("開始一局高低（按鈕選擇）")
+        .addIntegerOption((o) =>
+          o.setName("max")
+            .setDescription("最大值（預設 100）")
+            .setRequired(false)
+        )
+    )
+    .addSubcommand((s) =>
+      s.setName("stop").setDescription("停止本頻道高低")
+    )
+    .addSubcommand((s) =>
+      s.setName("status").setDescription("查看本頻道高低狀態")
+    ),
 
-  return cmds;
-}
+  // ✅ 終極密碼：不是 try，而是「直接在伺服器改數字」
+  new SlashCommandBuilder()
+    .setName("guess")
+    .setDescription("終極密碼（管理員設定答案，大家在頻道猜）")
+    .addSubcommand((s) =>
+      s.setName("set").setDescription("（管理員）直接設定答案數字")
+        .addIntegerOption((o) =>
+          o.setName("number").setDescription("答案數字").setRequired(true)
+        )
+        .addIntegerOption((o) =>
+          o.setName("min").setDescription("最小值（預設 1）").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o.setName("max").setDescription("最大值（預設 100）").setRequired(false)
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild) // 管理員權限
+    )
+    .addSubcommand((s) =>
+      s.setName("start").setDescription("開始終極密碼（沿用已設定答案或隨機）")
+        .addIntegerOption((o) =>
+          o.setName("min").setDescription("最小值（預設 1）").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o.setName("max").setDescription("最大值（預設 100）").setRequired(false)
+        )
+    )
+    .addSubcommand((s) =>
+      s.setName("stop").setDescription("停止本頻道終極密碼")
+    )
+    .addSubcommand((s) =>
+      s.setName("status").setDescription("查看本頻道終極密碼狀態")
+    ),
+].map((x) => x.toJSON());
 
-async function registerCommands() {
-  const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.CLIENT_ID;
-  const guildId = process.env.GUILD_ID;
+// ===== Handler（execute）=====
+const commands = new Map();
 
-  if (!token || !clientId) {
-    console.error("❌ 缺少 ENV：DISCORD_TOKEN / CLIENT_ID");
-    return;
-  }
+// /info
+commands.set("info", {
+  execute: async (interaction) => {
+    const msg =
+      [
+        "🎮 **遊戲指令**",
+        "• `/counting start|stop|status`：在頻道直接打數字接龍",
+        "• `/hl start|stop|status`：按鈕版高低",
+        "• `/guess set|start|stop|status`：終極密碼（管理員可直接設定答案）",
+        "",
+        "🏆 **加分規則**",
+        "• counting 正確一次：+2 分",
+        "• hl 猜中一次：+5 分",
+        "• 終極密碼猜到：+10 分",
+      ].join("\n");
+    return interaction.editReply(msg);
+  },
+});
 
-  const rest = new REST({ version: "10" }).setToken(token);
-  const body = buildCommands().map((c) => c.toJSON());
+// /points
+commands.set("points", {
+  execute: async (interaction) => {
+    const userId = interaction.user.id;
+    const p = await pointsDb.getPoints(userId);
+    return interaction.editReply(`⭐ 你的分數：**${p}**`);
+  },
+});
 
-  if (guildId) {
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body });
-    console.log("[Commands] Registered GUILD slash commands (instant)");
-  } else {
-    await rest.put(Routes.applicationCommands(clientId), { body });
-    console.log("[Commands] Registered GLOBAL slash commands");
-  }
-}
+// /rank
+commands.set("rank", {
+  execute: async (interaction) => {
+    // 你 pointsDb 若沒有 leaderboard，可先用簡單提示
+    if (!pointsDb.getLeaderboard) {
+      return interaction.editReply("❌ 目前沒有 getLeaderboard()，請先補上排行榜功能。");
+    }
+    const rows = await pointsDb.getLeaderboard(20);
+    if (!rows || rows.length === 0) return interaction.editReply("目前還沒有排行榜資料。");
 
-/* -------------------- handlers -------------------- */
-function makeCommandHandlers(client) {
-  const map = new Map();
+    const lines = rows.map((r, i) => `#${i + 1} <@${r.userId}>：**${r.points}**`);
+    return interaction.editReply("🏆 **排行榜 Top 20**\n" + lines.join("\n"));
+  },
+});
 
-  map.set("info", {
-    execute: async (interaction) => {
-      const uptime = Math.floor(process.uptime());
-      const rooms = state.getRooms();
-      await interaction.editReply(
-        [
-          "✅ **機器人狀態**",
-          `- 上線時間：${uptime}s`,
-          `- 目前房間狀態數：${rooms.length}`,
-          "",
-          "指令：/points /rank /guess /hl /counting",
-        ].join("\n")
+// /counting
+commands.set("counting", {
+  execute: async (interaction) => {
+    const sub = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
+
+    if (sub === "start") {
+      const startNumber = interaction.options.getInteger("start_number") ?? 1;
+      games.countingStart(channelId, startNumber);
+      return interaction.editReply(
+        `✅ counting 已開始！請在此頻道直接輸入數字，下一個應該是 **${startNumber}**`
       );
-    },
-  });
+    }
 
-  map.set("points", {
-    execute: async (interaction) => {
-      const u = interaction.options.getUser("user") || interaction.user;
-      const p = await pointsDb.getPoints(u.id);
-      await interaction.editReply(`💰 **${u.username}** 目前分數：**${p}**`);
-    },
-  });
+    if (sub === "stop") {
+      games.countingStop(channelId);
+      return interaction.editReply("🛑 counting 已停止。");
+    }
 
-  map.set("rank", {
-    execute: async (interaction) => {
-      // 需要 pointsDb.getLeaderboard
-      const rows = (await pointsDb.getLeaderboard?.(20)) || [];
-      if (!rows.length) return interaction.editReply("（目前沒有排行榜資料）");
+    if (sub === "status") {
+      const s = games.countingStatus(channelId);
+      return interaction.editReply(
+        s.active
+          ? `📌 counting 進行中：下一個數字應該是 **${s.expected}**（上一位：${s.lastUserId ? `<@${s.lastUserId}>` : "無"}）`
+          : "📌 counting 未啟動。"
+      );
+    }
+  },
+});
 
-      const lines = rows.map((r, i) => `#${i + 1}  <@${r.userId}>  —  **${r.points}**`);
-      await interaction.editReply(["🏆 **排行榜 Top 20**", ...lines].join("\n"));
-    },
-  });
+// /hl
+commands.set("hl", {
+  execute: async (interaction) => {
+    const sub = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
 
-  map.set("guess", {
-    execute: async (interaction) => {
-      const sub = interaction.options.getSubcommand();
-      const gid = interaction.guildId;
-      const cid = interaction.channelId;
+    if (sub === "start") {
+      const max = interaction.options.getInteger("max") ?? 100;
+      const res = await games.hlStart(interaction, channelId, max);
+      return interaction.editReply(res);
+    }
 
-      if (sub === "start") {
-        const min = interaction.options.getInteger("min") ?? 1;
-        const max = interaction.options.getInteger("max") ?? 100;
-        if (min >= max) return interaction.editReply("❌ min 必須小於 max");
+    if (sub === "stop") {
+      games.hlStop(channelId);
+      return interaction.editReply("🛑 hl 已停止。");
+    }
 
-        state.guessStart(gid, cid, min, max);
-        return interaction.editReply(`🎮 終極密碼開始！範圍 **${min} ~ ${max}**\n用 **/guess try n:數字** 來猜。`);
-      }
+    if (sub === "status") {
+      const s = games.hlStatus(channelId);
+      return interaction.editReply(
+        s.active ? `📌 hl 進行中（max=${s.max}）` : "📌 hl 未啟動。"
+      );
+    }
+  },
+});
 
-      if (sub === "stop") {
-        state.guessStop(gid, cid);
-        return interaction.editReply("✅ 已停止終極密碼。");
-      }
+// /guess（終極密碼）
+commands.set("guess", {
+  execute: async (interaction) => {
+    const sub = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
 
-      if (sub === "try") {
-        const n = interaction.options.getInteger("n");
-        const r = state.guessTry(gid, cid, n);
+    if (sub === "set") {
+      const number = interaction.options.getInteger("number");
+      const min = interaction.options.getInteger("min") ?? 1;
+      const max = interaction.options.getInteger("max") ?? 100;
+      games.guessSet(channelId, { min, max, secret: number });
+      return interaction.editReply(`✅ 已設定終極密碼：範圍 **${min}~${max}**，答案已更新（不會顯示給玩家）。`);
+    }
 
-        if (!r.ok && r.reason === "NOT_RUNNING") {
-          return interaction.editReply("❌ 目前沒有終極密碼在跑，先用 **/guess start** 開始。");
-        }
+    if (sub === "start") {
+      const min = interaction.options.getInteger("min") ?? 1;
+      const max = interaction.options.getInteger("max") ?? 100;
+      games.guessStart(channelId, { min, max });
+      return interaction.editReply(`✅ 終極密碼已開始！範圍 **${min}~${max}**（在頻道直接輸入數字猜）。`);
+    }
 
-        if (r.hit) {
-          // 猜中加分 +10（可改）
-          const after = await pointsDb.addPoints(interaction.user.id, 10);
-          return interaction.editReply(`🎉 猜中了！答案是 **${r.ans}**（+10 分）\n你目前分數：**${after}**`);
-        }
+    if (sub === "stop") {
+      games.guessStop(channelId);
+      return interaction.editReply("🛑 終極密碼已停止。");
+    }
 
-        if (r.hint === "UP") {
-          return interaction.editReply(`⬆️ 太小了！範圍變成 **${r.min} ~ ${r.max}**`);
-        }
-        return interaction.editReply(`⬇️ 太大了！範圍變成 **${r.min} ~ ${r.max}**`);
-      }
-    },
-  });
+    if (sub === "status") {
+      const s = games.guessStatus(channelId);
+      return interaction.editReply(
+        s.active
+          ? `📌 終極密碼進行中：範圍 **${s.min}~${s.max}**`
+          : "📌 終極密碼未啟動。"
+      );
+    }
+  },
+});
 
-  map.set("hl", {
-    execute: async (interaction) => {
-      const sub = interaction.options.getSubcommand();
-      const gid = interaction.guildId;
-      const cid = interaction.channelId;
-
-      if (sub === "start") {
-        const r = state.hlStart(gid, cid);
-        return interaction.editReply(`🃏 High/Low 開始！目前牌值：**${r.hl.current}**\n用 **/hl pick choice:high/low** 來猜。`);
-      }
-
-      if (sub === "stop") {
-        state.hlStop(gid, cid);
-        return interaction.editReply("✅ 已停止 High/Low。");
-      }
-
-      if (sub === "pick") {
-        const choice = interaction.options.getString("choice");
-        const r = state.hlPick(gid, cid, choice);
-
-        if (!r.ok && r.reason === "NOT_RUNNING") {
-          return interaction.editReply("❌ 目前沒有 High/Low 在跑，先用 **/hl start** 開始。");
-        }
-
-        if (r.win) {
-          const after = await pointsDb.addPoints(interaction.user.id, 5);
-          return interaction.editReply(
-            `✅ 你猜對了！原本 **${r.cur}** → 下一張 **${r.next}**\n連勝：**${r.streak}**（+5 分）\n你目前分數：**${after}**`
-          );
-        } else {
-          return interaction.editReply(`❌ 你猜錯了！原本 **${r.cur}** → 下一張 **${r.next}**\n連勝歸零。`);
-        }
-      }
-    },
-  });
-
-  map.set("counting", {
-    execute: async (interaction) => {
-      const sub = interaction.options.getSubcommand();
-      const gid = interaction.guildId;
-      const cid = interaction.channelId;
-
-      if (sub === "start") {
-        state.countingStart(gid, cid);
-        return interaction.editReply("🔢 數字接龍開始！\n請在此頻道直接打：`1` `2` `3` ...（不能同一個人連續）");
-      }
-
-      if (sub === "stop") {
-        state.countingStop(gid, cid);
-        return interaction.editReply("✅ 已停止數字接龍。");
-      }
-
-      if (sub === "status") {
-        const s = state.countingStatus(gid, cid);
-        if (!s.on) return interaction.editReply("ℹ️ 目前此頻道沒有數字接龍。");
-        return interaction.editReply(
-          `ℹ️ 數字接龍狀態：\n- 最後數字：**${s.last}**\n- 最後玩家：${s.lastUserId ? `<@${s.lastUserId}>` : "（無）"}\n- 連續成功：**${s.streak}**`
-        );
-      }
-    },
-  });
-
-  client.commands = map;
-  return map;
+// ===== Export =====
+function getSlashCommandData() {
+  return slashData;
 }
 
-module.exports = { registerCommands, makeCommandHandlers, buildCommands };
+function getCommand(name) {
+  // events.js 會用這個取 handler
+  return commands.get(name);
+}
+
+module.exports = {
+  getSlashCommandData,
+  getCommand,
+  commands,
+};
