@@ -1,119 +1,100 @@
 "use strict";
 
 /**
- * src/index.js (A 方案)
- * ✅ 只在這裡註冊 interactionCreate / messageCreate
- * ✅ 防止同一個 interaction 被處理兩次（同進程保險）
+ * src/index.js
+ * ✅ 只掛一次事件（避免同一個互動跑兩次）
+ * ✅ ChatInputCommand：統一 deferReply（commands 只用 editReply / followUp）
+ * ✅ Button：先給 lobbyButtons 處理；沒處理到再給 games.js（HL 按鈕）
  */
 
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-
-// 你的指令執行器（你原本那份）
 const commands = require("./bot/commands");
-
-// 遊戲（counting/guess/hl）
 const gamesMod = require("./bot/games");
+const lobbyButtons = require("./bot/lobbyButtons");
 
-// Firebase（可選：不一定有）
-let initFirebaseFn = null;
-try {
-  const fb = require("./db/firebase");
-  initFirebaseFn = typeof fb === "function" ? fb : fb?.initFirebase;
-} catch (_) {}
-
+// ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error("❌ Missing env: DISCORD_TOKEN");
   process.exit(1);
 }
 
+// ---- client ----
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // counting/guess 需要讀訊息
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel],
 });
 
-// ✅ 可選初始化 Firebase
-if (typeof initFirebaseFn === "function") {
-  try {
-    initFirebaseFn();
-    console.log("[Firebase] Initialized");
-  } catch (e) {
-    console.warn("[Firebase] init failed (ignore):", e?.message || e);
-  }
-}
-
-// ✅ 防止同一個 interaction 在同一進程被跑兩次
-const handledInteractions = new Set();
-function markHandled(interactionId) {
-  if (handledInteractions.has(interactionId)) return false;
-  handledInteractions.add(interactionId);
-  // 1 分鐘後清掉，避免 Set 無限增長
-  setTimeout(() => handledInteractions.delete(interactionId), 60_000).unref?.();
+// ---- anti-duplicate interaction guard ----
+const handledInteractionIds = new Set();
+function markHandled(id) {
+  if (handledInteractionIds.has(id)) return false;
+  handledInteractionIds.add(id);
+  // 簡單清理避免集合無限長
+  if (handledInteractionIds.size > 5000) handledInteractionIds.clear();
   return true;
 }
 
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
-  console.log("PID =", process.pid);
 
   try {
-    await registerCommands(client);
+    await registerCommands();
     console.log("[Commands] registered");
   } catch (e) {
     console.error("[Commands] register failed:", e);
   }
-
-  console.log("interactionCreate listeners =", client.listenerCount("interactionCreate"));
 });
 
-// ✅ 唯一的 interactionCreate
+// ✅ interactionCreate（只留這一個）
 client.on("interactionCreate", async (interaction) => {
   try {
-    // 1) HL 按鈕（Button interaction）
+    // ===== Buttons =====
     if (interaction.isButton()) {
-      // 同進程保險：避免按鈕互動也被處理兩次
       if (!markHandled(interaction.id)) return;
 
+      const handled = await lobbyButtons.handleButton(interaction, { client });
+      if (handled) return;
+
+      // HL 的 hi/lo/stop 等按鈕交給 games.js
       if (typeof gamesMod?.onInteraction === "function") {
         await gamesMod.onInteraction(interaction, { client });
       }
       return;
     }
 
-    // 2) Slash Command
+    // ===== Slash commands =====
     if (!interaction.isChatInputCommand()) return;
-
-    // 同進程保險：避免 slash 被處理兩次
     if (!markHandled(interaction.id)) return;
 
-    // 避免 3 秒超時（不設 ephemeral，避免「僅你可見」那種標籤）
+    // 統一 ACK（避免 Unknown interaction）
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply(); // public thinking
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
 
-    // 你 commands.js 內部請用 editReply / followUp
     await commands.execute(interaction, { client });
-
   } catch (err) {
     console.error("[interactionCreate] error:", err);
-
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
       } else {
-        await interaction.reply({ content: "❌ 指令執行出錯，請稍後再試。" });
+        await interaction.reply({
+          content: "❌ 指令執行出錯，請稍後再試。",
+          flags: MessageFlags.Ephemeral,
+        });
       }
     } catch (_) {}
   }
 });
 
-// ✅ counting / guess 用訊息輸入（messageCreate）
+// ===== messageCreate（給 counting/guess 用「聊天室打數字」）=====
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
