@@ -1,33 +1,324 @@
 "use strict";
 
-const { getDB } = require("./firebase");
+const express = require("express");
+const cookieParser = require("cookie-parser");
+const jwt = require("jsonwebtoken");
 
-async function getPoints(userId) {
-  const db = getDB();
-  const snap = await db.ref(`points/${userId}`).get();
-  return Number(snap.val() ?? 0);
+const { getDB } = require("../db/firebase");
+const { addPoints, getPoints, setPoints } = require("../db/points");
+
+const app = express();
+
+const { JWT_SECRET, ADMIN_USER, ADMIN_PASS } = process.env;
+
+if (!JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) {
+  console.error("❌ 缺少 ENV：JWT_SECRET / ADMIN_USER / ADMIN_PASS");
 }
 
-async function setPoints(userId, value) {
-  const db = getDB();
-  const v = Number(value) || 0;
-  await db.ref(`points/${userId}`).set(v);
-  return v;
+app.set("trust proxy", 1);
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+/* ================= Root ================= */
+app.get("/", (req, res) => res.send("OK"));
+
+/* ================= Auth ================= */
+function auth(req, res, next) {
+  const token = req.cookies.admin_token;
+  if (!token) return res.redirect("/admin/login");
+  try {
+    jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.redirect("/admin/login");
+  }
 }
 
-async function addPoints(userId, delta) {
-  const db = getDB();
-  const d = Number(delta) || 0;
-
-  // Realtime DB transaction：避免同時加分打架
-  const ref = db.ref(`points/${userId}`);
-  const result = await ref.transaction((cur) => {
-    const curNum = Number(cur ?? 0);
-    return curNum + d;
-  });
-
-  if (!result.committed) throw new Error("transaction not committed");
-  return Number(result.snapshot.val() ?? 0);
+function authApi(req, res, next) {
+  const token = req.cookies.admin_token;
+  if (!token) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+  try {
+    jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+  }
 }
 
-module.exports = { getPoints, setPoints, addPoints };
+/* ================= Login Page ================= */
+app.get("/admin/login", (req, res) => {
+  const err = req.query.err;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>管理員登入</title>
+<style>
+  :root{
+    --bg1:#060b1a;
+    --bg2:#0b1333;
+    --glass:rgba(255,255,255,.08);
+    --glass2:rgba(255,255,255,.12);
+    --line:rgba(255,255,255,.14);
+    --txt:rgba(255,255,255,.92);
+    --muted:rgba(255,255,255,.62);
+    --brand:#7c3aed;
+    --brand2:#22d3ee;
+    --bad:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; display:grid; place-items:center;
+    background: radial-gradient(1200px 600px at 20% 10%, rgba(124,58,237,.25), transparent 60%),
+                radial-gradient(900px 600px at 90% 30%, rgba(34,211,238,.18), transparent 60%),
+                linear-gradient(180deg, var(--bg1), var(--bg2));
+    font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC";
+    color:var(--txt);
+  }
+  .card{
+    width:min(420px, 92vw);
+    padding:22px;
+    border-radius:18px;
+    background:var(--glass);
+    border:1px solid var(--line);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 20px 60px rgba(0,0,0,.35);
+  }
+  .title{font-size:20px; font-weight:800; letter-spacing:.4px; margin:0 0 10px}
+  .sub{margin:0 0 18px; color:var(--muted); font-size:13px}
+  label{display:block; font-size:12px; color:var(--muted); margin:12px 0 6px}
+  input{
+    width:100%; padding:12px 12px;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.06);
+    color:var(--txt);
+    outline:none;
+  }
+  input:focus{border-color:rgba(34,211,238,.55); box-shadow:0 0 0 4px rgba(34,211,238,.12)}
+  .btn{
+    margin-top:14px; width:100%; padding:12px 14px;
+    border-radius:12px; border:0; cursor:pointer;
+    color:white; font-weight:800;
+    background: linear-gradient(90deg, var(--brand), var(--brand2));
+  }
+  .err{
+    margin-top:12px;
+    padding:10px 12px;
+    border-radius:12px;
+    background: rgba(239,68,68,.16);
+    border:1px solid rgba(239,68,68,.35);
+    color:#fecaca;
+    font-size:13px;
+  }
+</style>
+</head>
+<body>
+  <form class="card" method="POST" action="/admin/login">
+    <h1 class="title">管理員登入</h1>
+    <p class="sub">登入後可管理玩家積分與系統狀態</p>
+
+    <label>帳號</label>
+    <input name="user" autocomplete="username" required />
+
+    <label>密碼</label>
+    <input name="pass" type="password" autocomplete="current-password" required />
+
+    <button class="btn">登入</button>
+
+    ${err ? `<div class="err">帳號或密碼錯誤</div>` : ``}
+  </form>
+</body>
+</html>`);
+});
+
+/* ================= Login Handler ================= */
+app.post("/admin/login", (req, res) => {
+  const { user, pass } = req.body;
+
+  if (user === ADMIN_USER && pass === ADMIN_PASS) {
+    const token = jwt.sign({ user }, JWT_SECRET, { expiresIn: "12h" });
+
+    const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+    res.cookie("admin_token", token, {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: "lax",
+      maxAge: 12 * 60 * 60 * 1000,
+    });
+
+    return res.redirect("/admin");
+  }
+
+  res.redirect("/admin/login?err=1");
+});
+
+app.get("/admin/logout", (req, res) => {
+  res.clearCookie("admin_token");
+  res.redirect("/admin/login");
+});
+
+/* ================= Admin SPA ================= */
+app.get("/admin", auth, (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>管理後台</title>
+<style>
+  :root{
+    --bg1:#060b1a;
+    --bg2:#0b1333;
+    --glass:rgba(255,255,255,.08);
+    --glass2:rgba(255,255,255,.12);
+    --line:rgba(255,255,255,.14);
+    --txt:rgba(255,255,255,.92);
+    --muted:rgba(255,255,255,.62);
+    --brand:#7c3aed;
+    --brand2:#22d3ee;
+    --good:#34d399;
+    --bad:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh;
+    background: radial-gradient(1200px 600px at 20% 10%, rgba(124,58,237,.22), transparent 60%),
+                radial-gradient(900px 600px at 90% 30%, rgba(34,211,238,.18), transparent 60%),
+                linear-gradient(180deg, var(--bg1), var(--bg2));
+    font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC";
+    color:var(--txt);
+  }
+  .layout{display:grid; grid-template-columns: 280px 1fr; min-height:100vh}
+  .sidebar{
+    padding:18px;
+    border-right:1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.04);
+    backdrop-filter: blur(14px);
+  }
+  .brand{
+    display:flex; align-items:center; gap:10px;
+    padding:12px 12px; border-radius:16px;
+    background: var(--glass);
+    border: 1px solid var(--line);
+  }
+  .dot{
+    width:12px; height:12px; border-radius:50%;
+    background: linear-gradient(90deg, var(--brand), var(--brand2));
+    box-shadow:0 0 20px rgba(34,211,238,.35);
+  }
+  .brand b{letter-spacing:.3px}
+  .menu{margin-top:14px; display:grid; gap:8px}
+  .btn{
+    display:flex; align-items:center; gap:10px;
+    padding:12px 12px;
+    border-radius:14px;
+    border:1px solid rgba(255,255,255,.10);
+    background: rgba(255,255,255,.06);
+    color:var(--txt);
+    cursor:pointer;
+  }
+  .btn:hover{background: rgba(255,255,255,.10)}
+  .btn.active{border-color: rgba(34,211,238,.35); background: rgba(34,211,238,.08)}
+  .sidefoot{
+    margin-top:auto; padding-top:14px;
+    color:var(--muted); font-size:12px;
+  }
+  .logout{color: rgba(34,211,238,.9); text-decoration:none}
+  .main{padding:22px}
+  .top{
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:14px;
+  }
+  .title{font-size:22px; font-weight:900; letter-spacing:.3px}
+  .pill{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:10px 12px;
+    border-radius:999px;
+    background: var(--glass);
+    border:1px solid var(--line);
+    color:var(--muted);
+    font-size:12px;
+  }
+  .grid{display:grid; gap:12px}
+  .card{
+    padding:14px;
+    border-radius:18px;
+    background: var(--glass);
+    border:1px solid var(--line);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 16px 50px rgba(0,0,0,.25);
+  }
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+  .input{
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.06);
+    color:var(--txt);
+    outline:none;
+  }
+  .input:focus{border-color:rgba(34,211,238,.55); box-shadow:0 0 0 4px rgba(34,211,238,.12)}
+  table{width:100%; border-collapse:separate; border-spacing:0 10px}
+  thead th{color:var(--muted); font-size:12px; text-align:left; font-weight:700; padding:0 10px}
+  tbody tr{background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.10)}
+  tbody td{padding:12px 10px; vertical-align:middle}
+  tbody tr{border-radius:14px}
+  tbody tr td:first-child{border-top-left-radius:14px; border-bottom-left-radius:14px}
+  tbody tr td:last-child{border-top-right-radius:14px; border-bottom-right-radius:14px}
+  .avatar{width:34px; height:34px; border-radius:12px; object-fit:cover; border:1px solid rgba(255,255,255,.12)}
+  .name{font-weight:800}
+  .muted{color:var(--muted); font-size:12px}
+  .tag{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:8px 10px; border-radius:999px;
+    background: rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.10);
+    color:var(--muted);
+    font-size:12px;
+  }
+  .act{
+    display:flex; gap:8px; align-items:center; justify-content:flex-end;
+  }
+  .sbtn{
+    padding:9px 10px; border-radius:12px; border:1px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.06); color:var(--txt); cursor:pointer;
+    min-width:44px;
+  }
+  .sbtn:hover{background: rgba(255,255,255,.10)}
+  .sbtn.plus{border-color: rgba(52,211,153,.25)}
+  .sbtn.minus{border-color: rgba(239,68,68,.25)}
+  .toast{
+    position:fixed; right:18px; bottom:18px;
+    padding:10px 12px;
+    border-radius:14px;
+    background: rgba(0,0,0,.55);
+    border:1px solid rgba(255,255,255,.12);
+    color:white; font-size:13px;
+    opacity:0; transform:translateY(8px);
+    transition:.2s;
+    pointer-events:none;
+  }
+  .toast.show{opacity:1; transform:none}
+  @media (max-width: 960px){
+    .layout{grid-template-columns: 1fr}
+    .sidebar{position:sticky; top:0; z-index:10}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="dot"></span>
+      <div>
+        <b>管理後台</b><div class="muted">my-vibe-bot</div>
+      </div>
+    </div>
+
+    <div class="menu">
+      <button class="btn active" data-ta
