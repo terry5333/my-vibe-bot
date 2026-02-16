@@ -2,26 +2,21 @@
 
 /**
  * src/index.js
- * 統一策略：
- * - interactionCreate 一律先 deferReply(EPHEMERAL) 避免 10062
- * - commands.js：
- *    - 遊戲 start/stop -> channel.send() 然後 deleteReply()（你看到就是「直接開始」）
- *    - 查詢類 points/rank/info/status -> editReply()（私訊式顯示）
+ * ✅ 單一 interactionCreate：處理 slash + button
+ * ✅ 不自動 defer（由 commands 決定要公開 or 私訊），避免「已公開消息」+ 公開訊息兩段
  */
 
-const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
+
 const { registerCommands } = require("./bot/registerCommands");
 const commands = require("./bot/commands");
 const gamesMod = require("./bot/games");
 
-// Firebase：避免你遇到 initFirebase is not a function
-let initFirebase;
+// Firebase 你原本如果是「物件」不是 function，就不要直接呼叫
+let initFirebase = null;
 try {
-  const fb = require("./db/firebase");
-  initFirebase = typeof fb === "function" ? fb : fb?.initFirebase;
-} catch (_) {
-  initFirebase = null;
-}
+  initFirebase = require("./db/firebase");
+} catch (_) {}
 
 // ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -35,7 +30,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // counting/guess 需要讀取訊息
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel],
 });
@@ -43,10 +38,10 @@ const client = new Client({
 // ---- bootstrap ----
 if (typeof initFirebase === "function") {
   initFirebase();
-  console.log("[Firebase] Initialized");
+} else if (initFirebase && typeof initFirebase.init === "function") {
+  initFirebase.init();
 }
 
-// ready
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
@@ -58,35 +53,38 @@ client.once("ready", async () => {
   }
 });
 
-// ✅ 只保留一個 interactionCreate
+// ✅ 只留一個 interactionCreate
 client.on("interactionCreate", async (interaction) => {
   try {
-    if (!interaction.isChatInputCommand()) return;
-
-    // ✅ 永遠先 ACK（私密），避免 3 秒超時 Unknown interaction 10062
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // 1) slash command
+    if (interaction.isChatInputCommand()) {
+      await commands.execute(interaction, { client });
+      return;
     }
 
-    await commands.execute(interaction, { client });
+    // 2) buttons (RPS / BJ)
+    if (interaction.isButton()) {
+      if (typeof gamesMod?.onInteraction === "function") {
+        await gamesMod.onInteraction(interaction, { client });
+      }
+      return;
+    }
   } catch (err) {
     console.error("[interactionCreate] error:", err);
-
-    // 只能用不會二次 reply 的方式回
+    // 不要在這裡硬 reply（很容易 40060），讓各自模組處理即可
     try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
-      } else {
-        await interaction.reply({ content: "❌ 指令執行出錯，請稍後再試。", flags: MessageFlags.Ephemeral });
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.reply({ content: "❌ 發生錯誤", ephemeral: true });
       }
     } catch (_) {}
   }
 });
 
-// counting / guess：直接在頻道輸入數字
+// counting/guess：直接在頻道輸入
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
+
     if (typeof gamesMod?.onMessage === "function") {
       await gamesMod.onMessage(message, { client });
     }
