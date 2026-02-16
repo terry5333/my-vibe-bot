@@ -6,21 +6,22 @@ const { commandData, makeCommandHandlers } = require("./bot/commands");
 const { registerCommands } = require("./bot/registerCommands");
 const gamesMod = require("./bot/games");
 
-const firebase = require("./db/firebase"); // 沒有就刪掉這行與下面 init
+// 如果你有 firebase init 就留著，沒有就刪掉這兩行
+const firebase = require("./db/firebase");
 
-async function safeReply(interaction, payload) {
+async function safeEdit(interaction, payload) {
   try {
-    // payload 可以是 { content, ephemeral } 或 embeds 等
-    if (interaction.deferred) return await interaction.editReply(payload);
-    if (interaction.replied) return await interaction.followUp(payload);
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(payload);
+    }
     return await interaction.reply(payload);
   } catch (e) {
-    // 這裡吞掉，避免再噴 40060 把 bot 弄掛
+    // 吞掉避免把 bot 弄掛（尤其是 10062/40060）
   }
 }
 
 async function main() {
-  // Firebase（如果有）
+  // Firebase（可選）
   try {
     if (firebase?.init) await firebase.init();
     console.log("[Firebase] Initialized");
@@ -37,7 +38,7 @@ async function main() {
     partials: [Partials.Channel],
   });
 
-  // ✅ 全域防炸（避免 Unhandled 'error' event）
+  // 避免 Unhandled error 把程序炸掉
   process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
   process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
   client.on("error", (err) => console.error("[client error]", err));
@@ -55,13 +56,23 @@ async function main() {
     }
   });
 
-  // ✅ 只留「一個」interactionCreate
+  // ✅ 只保留一個 InteractionCreate
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    // ✅ 先 ack，避免 3 秒超時 → Unknown interaction(10062)
+    // 這裡用 public defer（ephemeral=false），才不會全部都變成私訊效果
+    try {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: false });
+      }
+    } catch (e) {
+      // defer 失敗就算了，後面會走 safeEdit
+    }
+
     const fn = handlers[interaction.commandName];
     if (!fn) {
-      await safeReply(interaction, { content: "❌ 這個指令沒有處理器。", ephemeral: true });
+      await safeEdit(interaction, { content: "❌ 這個指令沒有處理器。" });
       return;
     }
 
@@ -69,7 +80,8 @@ async function main() {
       await fn(interaction);
     } catch (err) {
       console.error("[interactionCreate] error:", err);
-      await safeReply(interaction, { content: "❌ 指令執行出錯，請稍後再試。", ephemeral: true });
+      // ✅ 這裡只 editReply，不會再 reply → 避免 40060
+      await safeEdit(interaction, { content: "❌ 指令執行出錯，請稍後再試。" });
     }
   });
 
