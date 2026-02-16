@@ -2,26 +2,16 @@
 
 /**
  * src/index.js
- * - ✅ 只留一個 interactionCreate handler（避免 40060 重複回覆）
- * - ✅ ChatInputCommand：先 ephemeral defer，指令用 channel.send() 發在頻道，最後 deleteReply()
- * - ✅ Button（HL）：交給 gamesMod.onInteraction 處理（不做 deferReply）
- * - ✅ messageCreate：counting/guess 讀頻道數字
+ * ✅ 只保留 1 個 interactionCreate handler（避免重複回覆）
+ * ✅ slash commands 一律 deferReply（避免 Unknown interaction 10062）
+ * ✅ 用 flags 取代 ephemeral（避免 deprecated warning）
  */
 
-const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
+const { Client, GatewayIntentBits, Partials, MessageFlags, Events } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const commands = require("./bot/commands");
-const gamesMod = require("./bot/games");
-
-// ---- Firebase init（避免 initFirebase is not a function）----
-function safeInitFirebase() {
-  try {
-    const fb = require("./db/firebase");
-    if (typeof fb === "function") return fb();
-    if (fb && typeof fb.initFirebase === "function") return fb.initFirebase();
-  } catch (_) {}
-}
+const adminCommands = require("./bot/commands_admin"); // 這包先只放 install/points/rank/info
+const gamesMod = require("./bot/games"); // 你原本的 counting/guess/hl message handler 之後會改成按鈕+房間
 
 // ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -35,77 +25,82 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // counting/guess 需要讀訊息
+    GatewayIntentBits.MessageContent, // counting 需要讀數字
   ],
   partials: [Partials.Channel],
 });
 
-// ---- bootstrap ----
-safeInitFirebase();
+// ---- firebase (可選) ----
+// 你之前炸掉是因為你 require 回來不是 function
+// 這裡做「超保守」相容：module.exports = function / {initFirebase} / {default}
+try {
+  const fb = require("./db/firebase");
+  const initFirebase = fb?.initFirebase || fb?.default || fb;
+  if (typeof initFirebase === "function") initFirebase();
+} catch (_) {
+  // 沒有 firebase 也沒關係，不要讓它炸
+}
 
-client.once("ready", async () => {
+let readyOnce = false;
+
+// v14: "ready"；v15+: "clientReady"
+// 我們兩個都掛，但用 readyOnce 防止跑兩次
+client.once(Events.ClientReady ?? "clientReady", async () => {
+  if (readyOnce) return;
+  readyOnce = true;
+
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
   try {
-    await registerCommands(client);
+    await registerCommands();
     console.log("[Commands] registered");
   } catch (e) {
     console.error("[Commands] register failed:", e);
   }
 });
 
-// ✅ 唯一 interactionCreate handler
-client.on("interactionCreate", async (interaction) => {
+client.once("ready", async () => {
+  // 保底相容
+  if (readyOnce) return;
+  readyOnce = true;
+
+  console.log(`[Discord] Logged in as ${client.user.tag}`);
+
   try {
-    // 1) 先處理「按鈕」（HL）
-    if (interaction.isButton()) {
-      if (typeof gamesMod?.onInteraction === "function") {
-        await gamesMod.onInteraction(interaction, { client });
-      }
-      return; // 按鈕就到此結束
-    }
+    await registerCommands();
+    console.log("[Commands] registered");
+  } catch (e) {
+    console.error("[Commands] register failed:", e);
+  }
+});
 
-    // 2) 只處理 Slash 指令
-    if (!interaction.isChatInputCommand()) return;
+// ✅ 唯一 interactionCreate handler（重點：避免回覆兩次）
+client.on(Events.InteractionCreate ?? "interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-    // 先 defer（ephemeral）避免超時 Unknown interaction 10062
+  try {
+    // 先 ACK，避免 3 秒超時 Unknown interaction (10062)
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
 
-    // 執行指令（commands.js 內會用 channel.send() 真正發到頻道）
-    const result = await commands.execute(interaction, { client });
-
-    // 預設刪掉 ephemeral 回覆，避免使用者看到多餘「已回覆/已公開」提示
-    const keepReply = Boolean(result && result.keepReply);
-    if (!keepReply) {
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.deleteReply();
-        }
-      } catch (_) {}
-    }
+    // 執行管理指令（install/points/rank/info）
+    await adminCommands.execute(interaction, { client });
   } catch (err) {
     console.error("[interactionCreate] error:", err);
 
-    // 出錯時：短暫 ephemeral 提示後刪掉
+    // 只能 editReply（避免 40060 already acknowledged）
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
-        setTimeout(() => interaction.deleteReply().catch(() => {}), 2000);
-      } else if (interaction.isRepliable?.()) {
-        await interaction.reply({
-          content: "❌ 指令執行出錯，請稍後再試。",
-          flags: MessageFlags.Ephemeral,
-        });
-        setTimeout(() => interaction.deleteReply().catch(() => {}), 2000);
       }
     } catch (_) {}
   }
 });
 
-// counting / guess：直接在頻道輸入數字
-client.on("messageCreate", async (message) => {
+// counting/guess (你說 counting 大廳要只能數字，後面會做)
+// 先保留你原本 games 的 onMessage
+client.on(Events.MessageCreate ?? "messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
