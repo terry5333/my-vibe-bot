@@ -2,356 +2,294 @@
 
 /**
  * src/bot/games.js
- * ✅ 新增 RPS + BlackJack
- * ✅ export: { games, onMessage, onInteraction }
+ * - counting：訊息輸入數字接龍
+ * - guess：訊息輸入猜數字
+ * - hl：按鈕式（預設 1~13，且開始就顯示底牌）
+ *
+ * 注意：這份是「可跑」的最小完整版本，先把你現在要的 1) 指令不重複 2) hl 改好。
  */
 
-const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require("discord.js");
 
-// -------------------- 工具 --------------------
-function rowOf(buttons) {
-  return new ActionRowBuilder().addComponents(buttons);
+const pointsDb = require("../db/points.js");
+
+// ---------- helpers ----------
+function isIntString(s) {
+  return typeof s === "string" && /^-?\d+$/.test(s.trim());
+}
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-function btn(id, label, style = ButtonStyle.Secondary, disabled = false) {
-  return new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
+// ---------- COUNTING ----------
+const countingState = new Map(); // channelId -> { active, expected, lastUserId }
+
+function countingStart(channelId, start = 1) {
+  countingState.set(channelId, {
+    active: true,
+    expected: start,
+    lastUserId: null,
+  });
+}
+function countingStop(channelId) {
+  countingState.delete(channelId);
+}
+function countingStatus(channelId) {
+  return countingState.get(channelId) || { active: false };
 }
 
-// -------------------- RPS --------------------
-// key: messageId -> state
-const rpsGames = new Map();
+// ---------- GUESS ----------
+const guessState = new Map(); // channelId -> { active, min, max, secret }
+
+function guessSet(channelId, { min = 1, max = 100, secret }) {
+  guessState.set(channelId, { active: true, min, max, secret });
+}
+function guessStart(channelId, { min = 1, max = 100 }) {
+  const secret = randInt(min, max);
+  guessState.set(channelId, { active: true, min, max, secret });
+}
+function guessStop(channelId) {
+  guessState.delete(channelId);
+}
+function guessStatus(channelId) {
+  return guessState.get(channelId) || { active: false };
+}
+
+// ---------- HL (High/Low card style) ----------
 /**
- * state = {
- *  channelId,
- *  opponentId|null,
- *  players: { [userId]: choice|null },
- *  done: boolean
- * }
+ * 概念：從 1..max 抽牌
+ * - 開始：先抽「底牌」current，直接顯示（你要求）
+ * - 玩家按 Higher / Lower 來猜下一張是否更大/更小
+ * - 猜對 +1 分，猜錯結束
+ * - 單人簡化：只有按鈕的人能玩（避免群友亂按）
  */
-const RPS = ["rock", "paper", "scissors"];
-const RPS_LABEL = { rock: "🪨 石頭", paper: "📄 布", scissors: "✂️ 剪刀" };
+const hlState = new Map(); // channelId -> { active, max, ownerId, current, score, messageId }
 
-function rpsWinner(a, b) {
-  if (a === b) return 0;
-  if (a === "rock" && b === "scissors") return 1;
-  if (a === "scissors" && b === "paper") return 1;
-  if (a === "paper" && b === "rock") return 1;
-  return -1;
+function hlStatus(channelId) {
+  return hlState.get(channelId) || { active: false };
+}
+function hlStop(channelId) {
+  hlState.delete(channelId);
 }
 
-function rpsComponents(disabled = false) {
-  return [
-    rowOf([
-      btn("rps:rock", "🪨 石頭", ButtonStyle.Primary, disabled),
-      btn("rps:paper", "📄 布", ButtonStyle.Primary, disabled),
-      btn("rps:scissors", "✂️ 剪刀", ButtonStyle.Primary, disabled),
-    ]),
-  ];
-}
+async function hlStart(interaction, channelId, max = 13) {
+  // ✅ 你要預設 1~13：commands.js 已給預設 13，這裡再保險一次
+  max = Number.isFinite(max) ? max : 13;
+  if (max < 2) max = 13;
 
-function rpsStart({ channelId, messageAuthorId, opponentId = null }) {
-  const content = opponentId
-    ? `🪨📄✂️ **猜拳對決！** <@${messageAuthorId}> vs <@${opponentId}>\n兩位都按一次按鈕後會自動結算。`
-    : `🪨📄✂️ **猜拳！** <@${messageAuthorId}> 請按按鈕出拳（你自己玩）。`;
+  const ownerId = interaction.user.id;
 
-  // 先回傳 UI，等 messageId 出來後由 onInteraction 內部補 state
-  // 我們用特殊方式：先把 state 暫存在 channelId + author 做 fallback
-  // 但更穩定方式是：在第一次按鈕 interaction 取得 message.id 後建立 state
-  return { content, components: rpsComponents(false), _meta: { channelId, messageAuthorId, opponentId } };
-}
-
-// -------------------- Blackjack --------------------
-// key: messageId -> state
-const bjGames = new Map();
-/**
- * state = {
- *  channelId,
- *  playerId,
- *  opponentId|null,
- *  deck: card[],
- *  playerHand: card[],
- *  dealerHand: card[],
- *  done: boolean
- * }
- */
-
-function makeDeck() {
-  // 4 副花色 * 13
-  const suits = ["♠", "♥", "♦", "♣"];
-  const deck = [];
-  for (const s of suits) {
-    for (let v = 1; v <= 13; v++) deck.push({ v, s });
-  }
-  // shuffle
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-  return deck;
-}
-
-function cardLabel(c) {
-  const map = { 1: "A", 11: "J", 12: "Q", 13: "K" };
-  const face = map[c.v] || String(c.v);
-  return `${c.s}${face}`;
-}
-
-function handValue(hand) {
-  // A = 1 or 11, JQK = 10
-  let sum = 0;
-  let aces = 0;
-  for (const c of hand) {
-    if (c.v === 1) {
-      aces++;
-      sum += 1;
-    } else if (c.v >= 11) sum += 10;
-    else sum += c.v;
-  }
-  // 升級 A 為 11（+10）只要不爆
-  while (aces > 0 && sum + 10 <= 21) {
-    sum += 10;
-    aces--;
-  }
-  return sum;
-}
-
-function bjRender(state) {
-  const p = state.playerHand.map(cardLabel).join(" ");
-  const d = state.dealerHand.map(cardLabel).join(" ");
-  const pv = handValue(state.playerHand);
-  const dv = handValue(state.dealerHand);
-
-  const header = state.opponentId
-    ? `🃏 **21點對決（同局）** <@${state.playerId}> vs <@${state.opponentId}>`
-    : `🃏 **21點** <@${state.playerId}>`;
-
-  const lines = [
-    header,
-    "",
-    `👤 玩家手牌：${p}  (**${pv}**)`,
-    `🤖 莊家手牌：${d}  (**${dv}**)`,
-  ];
-
-  return lines.join("\n");
-}
-
-function bjComponents(disabled = false) {
-  return [
-    rowOf([
-      btn("bj:hit", "➕ 要牌", ButtonStyle.Success, disabled),
-      btn("bj:stand", "✋ 停牌", ButtonStyle.Danger, disabled),
-    ]),
-  ];
-}
-
-function bjStart({ channelId, messageAuthorId, opponentId = null }) {
-  // 先回 UI，state 由 onInteraction 取得 messageId 後建立
-  const content = `🃏 **21點開始！** <@${messageAuthorId}> ${
-    opponentId ? `vs <@${opponentId}>` : ""
-  }\n（按「要牌/停牌」進行）`;
-
-  return { content, components: bjComponents(false), _meta: { channelId, messageAuthorId, opponentId } };
-}
-
-// -------------------- interaction 處理 --------------------
-async function onInteraction(interaction) {
-  const { customId } = interaction;
-
-  // 一律用 deferUpdate()，避免二次 reply
-  if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferUpdate();
+  // 若已在同頻道進行中，直接提示
+  const existing = hlState.get(channelId);
+  if (existing?.active) {
+    await interaction.channel.send("⚠️ 本頻道已有進行中的 HL，請先 /hl stop。");
+    return;
   }
 
-  // 取得 messageId（遊戲都綁在同一則訊息）
-  const messageId = interaction.message?.id;
-  if (!messageId) return;
+  // ✅ 開始就顯示底牌
+  const current = randInt(1, max);
 
-  // ---- RPS ----
-  if (customId.startsWith("rps:")) {
-    const choice = customId.split(":")[1];
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`hl:hi:${ownerId}`)
+      .setLabel("更大 (Higher)")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`hl:lo:${ownerId}`)
+      .setLabel("更小 (Lower)")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`hl:stop:${ownerId}`)
+      .setLabel("結束")
+      .setStyle(ButtonStyle.Danger)
+  );
 
-    // 建立 state（若不存在）
-    let st = rpsGames.get(messageId);
-    if (!st) {
-      // 從訊息內容推測：拿 mention 可能不可靠，所以這邊用最簡單：允許第一個按的人當 player1
-      // 如果你要更嚴謹（必須只有發起者/對手能按），把 _meta 存在 DB 或把 messageId 回傳後存起來
-      st = {
-        channelId: interaction.channelId,
-        opponentId: null,
-        players: {},
-        done: false,
-      };
-      rpsGames.set(messageId, st);
-    }
+  const msg = await interaction.channel.send({
+    content: `🂠 **HL 開始！**（範圍 1~${max}）\n✅ **底牌是：${current}**\n請按按鈕猜「下一張」會更大或更小。（只有 <@${ownerId}> 能操作）`,
+    components: [row],
+  });
 
-    if (st.done) return;
+  hlState.set(channelId, {
+    active: true,
+    max,
+    ownerId,
+    current,
+    score: 0,
+    messageId: msg.id,
+  });
+}
 
-    // 限制可玩的人（如果你想：只有訊息發起者/對手能按）
-    // 這裡採「如果對手尚未設定」，第一個按的人就是玩家；如果第二個按的人不同就變成對戰
-    if (!st.players[interaction.user.id]) st.players[interaction.user.id] = null;
+// ---------- message handler ----------
+async function onMessage(message) {
+  const channelId = message.channel.id;
 
-    // 記錄出拳
-    st.players[interaction.user.id] = choice;
+  // counting：非數字直接忽略（你之後要「非數字刪除＋警告」我們下一步再加）
+  const cs = countingState.get(channelId);
+  if (cs?.active) {
+    if (!isIntString(message.content)) return;
 
-    const playerIds = Object.keys(st.players);
+    const n = parseInt(message.content.trim(), 10);
 
-    // 自己玩（只有一個玩家）→ bot 隨機出拳直接結算
-    if (playerIds.length === 1 && !st.opponentId) {
-      const u = playerIds[0];
-      const botChoice = RPS[Math.floor(Math.random() * 3)];
-      const res = rpsWinner(st.players[u], botChoice);
-
-      st.done = true;
-
-      const resultLine =
-        res === 0
-          ? "🤝 平手！"
-          : res === 1
-          ? `🎉 <@${u}> 贏了！`
-          : `😵 <@${u}> 輸了！`;
-
-      const content =
-        `🪨📄✂️ **猜拳結算**\n` +
-        `<@${u}>：${RPS_LABEL[st.players[u]]}\n` +
-        `🤖 Bot：${RPS_LABEL[botChoice]}\n\n` +
-        resultLine;
-
-      await interaction.message.edit({ content, components: rpsComponents(true) });
+    // 同一人連打兩次
+    if (cs.lastUserId === message.author.id) {
+      countingState.delete(channelId);
+      await message.channel.send(`💥 <@${message.author.id}> 連打兩次！counting 結束。`);
       return;
     }
 
-    // 對戰（兩個玩家都要選）
-    if (playerIds.length >= 2) {
-      const [a, b] = playerIds.slice(0, 2);
-
-      if (!st.players[a] || !st.players[b]) {
-        // 還沒選完，更新提示
-        const content =
-          `🪨📄✂️ **猜拳對決進行中**\n` +
-          `<@${a}>：${st.players[a] ? "✅ 已出拳" : "⏳ 還沒出拳"}\n` +
-          `<@${b}>：${st.players[b] ? "✅ 已出拳" : "⏳ 還沒出拳"}\n` +
-          `（兩位都出拳後自動結算）`;
-
-        await interaction.message.edit({ content, components: rpsComponents(false) });
-        return;
-      }
-
-      const res = rpsWinner(st.players[a], st.players[b]);
-      st.done = true;
-
-      const resultLine =
-        res === 0
-          ? "🤝 平手！"
-          : res === 1
-          ? `🎉 <@${a}> 贏了！`
-          : `🎉 <@${b}> 贏了！`;
-
-      const content =
-        `🪨📄✂️ **猜拳結算**\n` +
-        `<@${a}>：${RPS_LABEL[st.players[a]]}\n` +
-        `<@${b}>：${RPS_LABEL[st.players[b]]}\n\n` +
-        resultLine;
-
-      await interaction.message.edit({ content, components: rpsComponents(true) });
+    // 打錯
+    if (n !== cs.expected) {
+      countingState.delete(channelId);
+      await message.channel.send(
+        `💥 <@${message.author.id}> 打錯了！應該是 **${cs.expected}**，counting 結束。`
+      );
       return;
+    }
+
+    // 正確
+    cs.lastUserId = message.author.id;
+    cs.expected += 1;
+
+    // 給一點點分（可自行調整）
+    if (pointsDb?.addPoints) {
+      await pointsDb.addPoints(message.author.id, 1).catch(() => {});
     }
 
     return;
   }
 
-  // ---- BJ ----
-  if (customId.startsWith("bj:")) {
-    let st = bjGames.get(messageId);
-    if (!st) {
-      // 初始化一局（用按的人當玩家）
-      const deck = makeDeck();
-      const playerHand = [deck.pop(), deck.pop()];
-      const dealerHand = [deck.pop(), deck.pop()];
+  // guess：只吃數字
+  const gs = guessState.get(channelId);
+  if (gs?.active) {
+    if (!isIntString(message.content)) return;
 
-      st = {
-        channelId: interaction.channelId,
-        playerId: interaction.user.id,
-        opponentId: null,
-        deck,
-        playerHand,
-        dealerHand,
-        done: false,
-      };
-      bjGames.set(messageId, st);
+    const n = parseInt(message.content.trim(), 10);
 
-      // 一開始就把牌面渲染（直接開始）
-      await interaction.message.edit({
-        content: bjRender(st),
-        components: bjComponents(false),
-      });
-    }
-
-    if (st.done) return;
-
-    // 限制只有玩家能按（避免別人亂點）
-    if (interaction.user.id !== st.playerId) {
-      // 不要 reply，避免打擾，只做小提示（改成不動也行）
+    if (n <= gs.min || n >= gs.max) {
+      // 範圍外：提醒但不結束
+      await message.channel.send(`⛔ 範圍是 **${gs.min} ~ ${gs.max}**（不含邊界），請再猜。`);
       return;
     }
 
-    const action = customId.split(":")[1];
-
-    if (action === "hit") {
-      st.playerHand.push(st.deck.pop());
-      const pv = handValue(st.playerHand);
-
-      if (pv > 21) {
-        st.done = true;
-        await interaction.message.edit({
-          content: bjRender(st) + "\n\n💥 爆掉了！你輸了 😵",
-          components: bjComponents(true),
-        });
-        return;
+    if (n === gs.secret) {
+      guessState.delete(channelId);
+      await message.channel.send(`🎉 <@${message.author.id}> 猜中了！密碼就是 **${n}**（+10 分）`);
+      if (pointsDb?.addPoints) {
+        await pointsDb.addPoints(message.author.id, 10).catch(() => {});
       }
-
-      await interaction.message.edit({
-        content: bjRender(st),
-        components: bjComponents(false),
-      });
       return;
     }
 
-    if (action === "stand") {
-      // 莊家補牌到 17+
-      while (handValue(st.dealerHand) < 17) {
-        st.dealerHand.push(st.deck.pop());
-      }
+    // 收斂範圍
+    if (n < gs.secret) gs.min = n;
+    else gs.max = n;
 
-      st.done = true;
-
-      const pv = handValue(st.playerHand);
-      const dv = handValue(st.dealerHand);
-
-      let result = "";
-      if (dv > 21) result = "🎉 莊家爆了！你贏了！";
-      else if (pv > dv) result = "🎉 你贏了！";
-      else if (pv < dv) result = "😵 你輸了！";
-      else result = "🤝 平手！";
-
-      await interaction.message.edit({
-        content: bjRender(st) + `\n\n${result}`,
-        components: bjComponents(true),
-      });
-      return;
-    }
+    await message.channel.send(`🔎 新範圍：**${gs.min} ~ ${gs.max}**`);
+    return;
   }
 }
 
-// -------------------- messageCreate（保留你原本 counting/guess 用）--------------------
-async function onMessage(message) {
-  // 你原本的 counting/guess 文字輸入邏輯如果在別的 games.js 內
-  // 這裡先留空避免報錯
+// ---------- interaction handler for HL buttons ----------
+async function onInteraction(interaction) {
+  if (!interaction.isButton()) return;
+
+  const [game, action, ownerId] = interaction.customId.split(":");
+  if (game !== "hl") return;
+
+  // 只允許房主操作
+  if (interaction.user.id !== ownerId) {
+    try {
+      await interaction.reply({ content: "❌ 這不是你的 HL。", ephemeral: true });
+    } catch (_) {}
+    return;
+  }
+
+  const channelId = interaction.channelId;
+  const st = hlState.get(channelId);
+  if (!st?.active) {
+    try {
+      await interaction.reply({ content: "ℹ️ 這局 HL 已結束。", ephemeral: true });
+    } catch (_) {}
+    return;
+  }
+
+  if (action === "stop") {
+    hlState.delete(channelId);
+    try {
+      await interaction.update({ components: [] });
+    } catch (_) {}
+    await interaction.channel.send(`🛑 HL 結束。<@${ownerId}> 本局得分：**${st.score}**`);
+    return;
+  }
+
+  // 抽下一張
+  const next = randInt(1, st.max);
+  const prev = st.current;
+
+  let ok = false;
+  if (action === "hi") ok = next > prev;
+  if (action === "lo") ok = next < prev;
+
+  if (ok) st.score += 1;
+
+  st.current = next;
+
+  if (!ok) {
+    hlState.delete(channelId);
+
+    // 關按鈕
+    try {
+      await interaction.update({ components: [] });
+    } catch (_) {}
+
+    await interaction.channel.send(
+      `💥 猜錯！上一張 **${prev}**，下一張 **${next}**。\n🛑 HL 結束。<@${ownerId}> 本局得分：**${st.score}**`
+    );
+    return;
+  }
+
+  // 猜對：繼續顯示底牌（現在的牌）
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`hl:hi:${ownerId}`)
+      .setLabel("更大 (Higher)")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`hl:lo:${ownerId}`)
+      .setLabel("更小 (Lower)")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`hl:stop:${ownerId}`)
+      .setLabel("結束")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  try {
+    await interaction.update({
+      content: `🂠 HL 進行中（1~${st.max}）\n✅ 目前底牌：**${st.current}**\n分數：**${st.score}**`,
+      components: [row],
+    });
+  } catch (_) {}
 }
 
-// -------------------- exports --------------------
+// 把 button handler 掛在 exports，讓 index.js 也可以加（如果你想）
 const games = {
-  rpsStart,
-  bjStart,
+  countingStart,
+  countingStop,
+  countingStatus,
+
+  guessSet,
+  guessStart,
+  guessStop,
+  guessStatus,
+
+  hlStart,
+  hlStop,
+  hlStatus,
 };
 
 module.exports = {
