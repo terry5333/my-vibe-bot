@@ -1,97 +1,91 @@
 "use strict";
 
-const { Client, GatewayIntentBits, Partials, Events } = require("discord.js");
+/**
+ * src/index.js
+ * A 方案：index.js 統一 deferReply()，commands 只能 editReply / followUp
+ */
 
-const { commandData, makeCommandHandlers } = require("./bot/commands");
+const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
+
 const { registerCommands } = require("./bot/registerCommands");
-const gamesMod = require("./bot/games");
+const commands = require("./bot/commands"); // 你貼的那份 commands.js (commandData + execute)
+const gamesMod = require("./bot/games");    // games.js：module.exports = { games, onMessage }
+const initFirebase = require("./db/firebase"); // 你原本的 Firebase 初始化（如果沒有就刪掉）
 
-// 你的 firebase 有就留，沒有就刪掉
-const firebase = require("./db/firebase");
-
-async function safeRespond(interaction, payload) {
-  try {
-    if (interaction.deferred || interaction.replied) {
-      return await interaction.editReply(payload);
-    }
-    return await interaction.reply(payload);
-  } catch (_) {
-    // 避免 10062/40060 讓程式炸掉
-  }
+// ---- env ----
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) {
+  console.error("❌ Missing env: DISCORD_TOKEN");
+  process.exit(1);
 }
 
-async function main() {
-  // Firebase（可選）
+// ---- client ----
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // 需要讀取頻道輸入數字（counting/guess）
+  ],
+  partials: [Partials.Channel],
+});
+
+// ---- bootstrap ----
+initFirebase?.(); // 有就跑，沒有就忽略
+
+client.once("ready", async () => {
+  console.log(`[Discord] Logged in as ${client.user.tag}`);
+
+  // 註冊 slash commands（你目前 log 顯示 guild 註冊成功）
   try {
-    if (firebase?.init) await firebase.init();
-    console.log("[Firebase] Initialized");
+    await registerCommands(client);
+    console.log("[Commands] registered");
   } catch (e) {
-    console.log("[Firebase] init skipped:", e?.message || e);
+    console.error("[Commands] register failed:", e);
   }
+});
 
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
-    partials: [Partials.Channel],
-  });
-
-  process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
-  process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
-  client.on("error", (err) => console.error("[client error]", err));
-
-  const handlers = makeCommandHandlers({ client });
-
-  client.once(Events.ClientReady, async () => {
-    console.log(`[Discord] Logged in as ${client.user.tag}`);
-
-    try {
-      await registerCommands(commandData);
-      console.log("[Commands] registered");
-    } catch (e) {
-      console.error("[Commands] register failed:", e);
-    }
-  });
-
-  client.on(Events.InteractionCreate, async (interaction) => {
+// ✅ 確保「只」有一個 interactionCreate handler
+client.on("interactionCreate", async (interaction) => {
+  try {
     if (!interaction.isChatInputCommand()) return;
 
-    // ✅ 一進來就 ack（避免 10062）
+    // 1) 先 ACK：統一 defer（避免 3 秒超時 Unknown interaction 10062）
+    //    用 flags 取代 ephemeral（避免你 log 的 deprecated warning）
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    }
+
+    // 2) 執行指令（commands.js 裡只能 editReply/followUp）
+    await commands.execute(interaction, { client });
+
+  } catch (err) {
+    console.error("[interactionCreate] error:", err);
+
+    // 這裡也要用「不會二次 reply」的方式回覆
     try {
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: false }); // 公開
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
+      } else {
+        await interaction.reply({
+          content: "❌ 指令執行出錯，請稍後再試。",
+          flags: MessageFlags.Ephemeral,
+        });
       }
     } catch (_) {}
-
-    const fn = handlers[interaction.commandName];
-    if (!fn) {
-      await safeRespond(interaction, { content: "❌ 這個指令沒有處理器。" });
-      return;
-    }
-
-    try {
-      await fn(interaction);
-    } catch (err) {
-      console.error("[interactionCreate] error:", err);
-      // ✅ 這裡永遠只 editReply，不會第二次 reply
-      await safeRespond(interaction, { content: "❌ 指令執行出錯，請稍後再試。" });
-    }
-  });
-
-  client.on(Events.MessageCreate, async (msg) => {
-    try {
-      await gamesMod?.onMessage?.(msg);
-    } catch (e) {
-      console.error("[messageCreate] error:", e);
-    }
-  });
-
-  await client.login(process.env.DISCORD_TOKEN);
-}
-
-main().catch((e) => {
-  console.error("❌ Fatal:", e);
-  process.exit(1);
+  }
 });
+
+// counting / guess 要「直接在頻道輸入數字」：messageCreate
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author.bot) return;
+
+    if (typeof gamesMod?.onMessage === "function") {
+      await gamesMod.onMessage(message, { client });
+    }
+  } catch (err) {
+    console.error("[messageCreate] error:", err);
+  }
+});
+
+client.login(DISCORD_TOKEN);
