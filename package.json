@@ -1,20 +1,12 @@
 {
   "name": "my-vibe-bot",
   "version": "4.0.0",
-  "description": "Discord bot + Firebase RTDB + Admin Panel (JWT) + Games + History",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "cookie-parser": "^1.4.6",
-    "discord.js": "^14.14.1",
-    "express": "^4.19.2",
-    "firebase-admin": "^12.7.0",
-    "jsonwebtoken": "^9.0.2"
+    "discord.js": "^14.15.3"
   }
 }
