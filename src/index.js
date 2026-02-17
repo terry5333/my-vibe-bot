@@ -2,10 +2,9 @@
 
 /**
  * src/index.js
- * ✅ 只掛一次事件（避免同一互動跑兩次）
- * ✅ Slash：統一 deferReply（ephemeral）
- * ✅ Button：先 deferUpdate（避免超時），再交給 lobbyButtons / games
- * ✅ messageCreate：給 games（counting/guess 用聊天室輸入）
+ * ✅ 只掛一次事件（避免同一個互動跑兩次）
+ * ✅ ChatInputCommand：統一 deferReply（commands 只用 editReply / followUp）
+ * ✅ Button / Modal：先給 lobbyButtons 處理；沒處理到再給 games.js（HL 按鈕）
  */
 
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
@@ -32,7 +31,7 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// ---- anti-duplicate interaction guard ----
+// ---- anti-duplicate interaction guard (同一進程防重複) ----
 const handledInteractionIds = new Set();
 function markHandled(id) {
   if (handledInteractionIds.has(id)) return false;
@@ -55,26 +54,16 @@ client.once("ready", async () => {
 // ✅ interactionCreate（只留這一個）
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ===== Buttons =====
-    if (interaction.isButton()) {
-      if (!markHandled(interaction.id)) return;
+    // 所有互動都先防「同一進程重複」
+    if (!markHandled(interaction.id)) return;
 
-      // ✅ 先 ACK（避免 3 秒超時 / Unknown interaction）
-      // - 如果 lobbyButtons 之後要回 ephemeral，請在 lobbyButtons 裡用 reply/editReply（不要靠 update）
-      if (!interaction.deferred && !interaction.replied) {
-        try {
-          await interaction.deferUpdate();
-        } catch (_) {
-          // 有時候已被 ack 會丟錯，吞掉即可
-        }
-      }
-
-      // 1) 先給大廳按鈕處理
-      const handled = await lobbyButtons.handleButton(interaction, { client });
+    // ===== Buttons / Modals / Selects 都先給 lobbyButtons =====
+    if (interaction.isButton() || interaction.isModalSubmit() || interaction.isAnySelectMenu()) {
+      const handled = await lobbyButtons.handleInteraction(interaction, { client });
       if (handled) return;
 
-      // 2) 沒處理到再給 games（例如 HL 的 hi/lo/stop）
-      if (typeof gamesMod?.onInteraction === "function") {
+      // HL 的 hi/lo/stop 等按鈕交給 games.js
+      if (interaction.isButton() && typeof gamesMod?.onInteraction === "function") {
         await gamesMod.onInteraction(interaction, { client });
       }
       return;
@@ -82,9 +71,7 @@ client.on("interactionCreate", async (interaction) => {
 
     // ===== Slash commands =====
     if (!interaction.isChatInputCommand()) return;
-    if (!markHandled(interaction.id)) return;
 
-    // ✅ 統一 ACK（避免 Unknown interaction）
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
@@ -92,19 +79,9 @@ client.on("interactionCreate", async (interaction) => {
     await commands.execute(interaction, { client });
   } catch (err) {
     console.error("[interactionCreate] error:", err);
-
-    // ⚠️ Error 回覆也不能二次 reply
     try {
       if (interaction.deferred || interaction.replied) {
-        // Button 已 deferUpdate 的話 editReply 可能不存在 → 用 followUp (ephemeral)
-        if (interaction.isButton()) {
-          await interaction.followUp({
-            content: "❌ 操作失敗，請稍後再試。",
-            flags: MessageFlags.Ephemeral,
-          });
-        } else {
-          await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
-        }
+        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
       } else {
         await interaction.reply({
           content: "❌ 指令執行出錯，請稍後再試。",
@@ -119,6 +96,9 @@ client.on("interactionCreate", async (interaction) => {
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
+
+    // 房間/大廳活動都算「有行動」
+    lobbyButtons.pingActivity(message.channelId, message.author.id);
 
     if (typeof gamesMod?.onMessage === "function") {
       await gamesMod.onMessage(message, { client });
