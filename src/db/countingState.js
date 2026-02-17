@@ -1,44 +1,43 @@
 "use strict";
 
 /**
- * src/db/countingState.js
- * Firestore: counting
+ * Firestore Counting 狀態
+ * doc 路徑：countingState/{guildId}
  */
 
 const initFirebase = require("./initFirebase");
 
-function mustDb() {
+async function getDb() {
   const admin = initFirebase();
   if (!admin) throw new Error("Firebase not initialized");
   return admin.firestore();
 }
 
-function docId(guildId, channelId) {
-  return `${guildId}_${channelId}`;
-}
-
-async function getCounting(guildId, channelId) {
-  const db = mustDb();
-  const ref = db.collection("counting").doc(docId(guildId, channelId));
+async function getCounting(guildId) {
+  const db = await getDb();
+  const ref = db.collection("countingState").doc(String(guildId));
   const snap = await ref.get();
   if (!snap.exists) {
-    return { state: "stopped", expected: 1, lastUserId: null };
+    return { guildId, state: "stopped", channelId: null, expected: 1, lastUserId: null };
   }
   const d = snap.data() || {};
   return {
+    guildId,
     state: d.state || "stopped",
-    expected: Number.isFinite(d.expected) ? d.expected : 1,
+    channelId: d.channelId || null,
+    expected: typeof d.expected === "number" ? d.expected : 1,
     lastUserId: d.lastUserId || null,
   };
 }
 
 async function setCounting(guildId, channelId, patch) {
-  const db = mustDb();
-  const ref = db.collection("counting").doc(docId(guildId, channelId));
+  const db = await getDb();
+  const ref = db.collection("countingState").doc(String(guildId));
+
   await ref.set(
     {
       guildId,
-      channelId,
+      channelId: channelId || null,
       ...patch,
       updatedAt: Date.now(),
     },
@@ -46,16 +45,7 @@ async function setCounting(guildId, channelId, patch) {
   );
 }
 
-async function resetCounting(guildId, channelId, start = 1) {
-  await setCounting(guildId, channelId, {
-    state: "playing",
-    expected: start,
-    lastUserId: null,
-  });
-}
-
 module.exports = {
   getCounting,
   setCounting,
-  resetCounting,
 };
