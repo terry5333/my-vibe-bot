@@ -2,55 +2,35 @@
 
 const admin = require("firebase-admin");
 
-let _db = null;
+let appInitialized = false;
 
 function initFirebase() {
-  if (admin.apps.length) {
-    _db = admin.database();
-    console.log("[Firebase] Initialized (reuse)");
-    return _db;
+  if (appInitialized || admin.apps.length > 0) {
+    return admin;
   }
 
-  const rawUrl =
-    process.env.FIREBASE_DB_URL ||
-    process.env.FIREBASE_DATABASE_URL ||
-    process.env.DATABASE_URL;
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
 
-  if (!rawUrl) {
-    throw new Error("Missing ENV: FIREBASE_DB_URL (Firebase Realtime Database URL)");
+  if (!b64) {
+    console.warn("[Firebase] FIREBASE_SERVICE_ACCOUNT_B64 not set");
+    return null;
   }
 
-  // ✅ 強制把子路徑砍掉，只留 origin（避免你填到 /points 這種）
-  let url;
   try {
-    url = new URL(rawUrl).origin;
-  } catch {
-    throw new Error(`Invalid FIREBASE_DB_URL: ${rawUrl}`);
-  }
+    const json = Buffer.from(b64, "base64").toString("utf8");
+    const serviceAccount = JSON.parse(json);
 
-  // 你如果是用 service account JSON，通常是放在 FIREBASE_SERVICE_ACCOUNT
-  // 或者用 GOOGLE_APPLICATION_CREDENTIALS 指到檔案
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
-      credential: admin.credential.cert(sa),
-      databaseURL: url,
+      credential: admin.credential.cert(serviceAccount),
     });
-  } else {
-    // 讓平台（Render/Railway）用預設認證方式（如果你有設定）
-    admin.initializeApp({
-      databaseURL: url,
-    });
-  }
 
-  _db = admin.database();
-  console.log("[Firebase] Initialized");
-  return _db;
+    appInitialized = true;
+    console.log("[Firebase] Initialized (Firestore ready)");
+    return admin;
+  } catch (err) {
+    console.error("[Firebase] Init failed:", err);
+    throw err;
+  }
 }
 
-function getDB() {
-  if (!_db) initFirebase();
-  return _db;
-}
-
-module.exports = { initFirebase, getDB };
+module.exports = initFirebase;
