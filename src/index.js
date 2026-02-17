@@ -2,9 +2,10 @@
 
 /**
  * src/index.js
- * ✅ 只掛一次事件（避免同一個互動跑兩次）
- * ✅ ChatInputCommand：統一 deferReply（commands 只用 editReply / followUp）
- * ✅ Button：先給 lobbyButtons 處理；沒處理到再給 games.js（HL 按鈕）
+ * ✅ 只掛一次事件（避免同一互動跑兩次）
+ * ✅ Slash：統一 deferReply（ephemeral）
+ * ✅ Button：先 deferUpdate（避免超時），再交給 lobbyButtons / games
+ * ✅ messageCreate：給 games（counting/guess 用聊天室輸入）
  */
 
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
@@ -36,7 +37,6 @@ const handledInteractionIds = new Set();
 function markHandled(id) {
   if (handledInteractionIds.has(id)) return false;
   handledInteractionIds.add(id);
-  // 簡單清理避免集合無限長
   if (handledInteractionIds.size > 5000) handledInteractionIds.clear();
   return true;
 }
@@ -59,10 +59,21 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       if (!markHandled(interaction.id)) return;
 
+      // ✅ 先 ACK（避免 3 秒超時 / Unknown interaction）
+      // - 如果 lobbyButtons 之後要回 ephemeral，請在 lobbyButtons 裡用 reply/editReply（不要靠 update）
+      if (!interaction.deferred && !interaction.replied) {
+        try {
+          await interaction.deferUpdate();
+        } catch (_) {
+          // 有時候已被 ack 會丟錯，吞掉即可
+        }
+      }
+
+      // 1) 先給大廳按鈕處理
       const handled = await lobbyButtons.handleButton(interaction, { client });
       if (handled) return;
 
-      // HL 的 hi/lo/stop 等按鈕交給 games.js
+      // 2) 沒處理到再給 games（例如 HL 的 hi/lo/stop）
       if (typeof gamesMod?.onInteraction === "function") {
         await gamesMod.onInteraction(interaction, { client });
       }
@@ -73,7 +84,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (!markHandled(interaction.id)) return;
 
-    // 統一 ACK（避免 Unknown interaction）
+    // ✅ 統一 ACK（避免 Unknown interaction）
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
@@ -81,9 +92,19 @@ client.on("interactionCreate", async (interaction) => {
     await commands.execute(interaction, { client });
   } catch (err) {
     console.error("[interactionCreate] error:", err);
+
+    // ⚠️ Error 回覆也不能二次 reply
     try {
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
+        // Button 已 deferUpdate 的話 editReply 可能不存在 → 用 followUp (ephemeral)
+        if (interaction.isButton()) {
+          await interaction.followUp({
+            content: "❌ 操作失敗，請稍後再試。",
+            flags: MessageFlags.Ephemeral,
+          });
+        } else {
+          await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
+        }
       } else {
         await interaction.reply({
           content: "❌ 指令執行出錯，請稍後再試。",
