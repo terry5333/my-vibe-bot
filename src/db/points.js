@@ -1,52 +1,49 @@
 "use strict";
 
-const { getDb } = require("./firestore");
+/**
+ * Firestore 積分系統
+ */
 
-const COLLECTION = "users";
+const admin = require("firebase-admin");
 
-async function addPoints(userId, amount) {
-  const db = getDb();
-  const ref = db.collection(COLLECTION).doc(userId);
+let db;
 
-  await db.runTransaction(async (t) => {
-    const doc = await t.get(ref);
-    const current = doc.exists ? doc.data().points || 0 : 0;
-    t.set(ref, { points: current + amount }, { merge: true });
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
   });
 }
 
-async function setPoints(userId, amount) {
-  const db = getDb();
-  await db.collection(COLLECTION).doc(userId).set(
-    { points: amount },
-    { merge: true }
-  );
-}
+db = admin.firestore();
+const col = db.collection("points");
 
 async function getPoints(userId) {
-  const db = getDb();
-  const doc = await db.collection(COLLECTION).doc(userId).get();
+  const doc = await col.doc(userId).get();
   if (!doc.exists) return 0;
   return doc.data().points || 0;
 }
 
-async function getLeaderboard(limit = 10) {
-  const db = getDb();
-  const snap = await db
-    .collection(COLLECTION)
-    .orderBy("points", "desc")
-    .limit(limit)
-    .get();
+async function addPoints(userId, amount) {
+  const ref = col.doc(userId);
 
-  return snap.docs.map((d) => ({
-    userId: d.id,
-    points: d.data().points || 0,
-  }));
+  await db.runTransaction(async (t) => {
+    const doc = await t.get(ref);
+    const current = doc.exists ? (doc.data().points || 0) : 0;
+    const next = current + amount;
+
+    t.set(ref, { points: next }, { merge: true });
+
+    console.log("✅ Firestore 寫入成功:", userId, next);
+  });
+}
+
+async function setPoints(userId, amount) {
+  await col.doc(userId).set({ points: amount }, { merge: true });
+  console.log("✅ Firestore set:", userId, amount);
 }
 
 module.exports = {
+  getPoints,
   addPoints,
   setPoints,
-  getPoints,
-  getLeaderboard,
 };
