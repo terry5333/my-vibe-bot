@@ -7,6 +7,7 @@
  * - Counting：🟩-counting 大廳聊天接龍；控制按鈕放在「管理員區」面板
  * - 防多進程重複創房：Firestore room lock（roomState）
  * - AFK 自動關房（可調）
+ * - Button 互動：安全 ACK（避免 40060 / 10062）
  */
 
 const {
@@ -57,10 +58,12 @@ let afkTimerStarted = false;
 
 // ====== helpers ======
 function sanitizeName(name) {
-  return String(name || "player")
-    .replace(/[^\p{L}\p{N}\- _]/gu, "")
-    .trim()
-    .slice(0, 20) || "player";
+  return (
+    String(name || "player")
+      .replace(/[^\p{L}\p{N}\- _]/gu, "")
+      .trim()
+      .slice(0, 20) || "player"
+  );
 }
 
 function isAdminMember(interaction) {
@@ -101,6 +104,7 @@ async function upsertMarkerMessage(channel, marker, payload) {
   const old = msgs?.find(
     (m) => m.author?.id === channel.client.user.id && m.content?.includes(marker)
   );
+
   if (old) return await old.edit(payload);
   return await channel.send({ ...payload, content: `${marker}\n${payload.content}` });
 }
@@ -110,7 +114,9 @@ function buildLobbyPayload(gameKey) {
   if (gameKey === "counting") {
     return {
       content:
-        "🟩 **Counting 大廳**\n🔢 管理員在「🛠-admin-panel」按下「開始」後，大家才能在這裡輸入數字接龍。\n⛔ 未開始/暫停/停止時，任何訊息都會被刪除並私訊提醒。",
+        "🟩 **Counting 大廳**\n" +
+        "🔢 管理員在「🛠-admin-panel」按下「開始」後，大家才能在這裡輸入數字接龍。\n" +
+        "⛔ 未開始/暫停/停止時，任何訊息都會被刪除並私訊提醒。",
       components: [],
     };
   }
@@ -145,8 +151,7 @@ function buildAdminPanelPayload(guildId) {
   );
 
   return {
-    content:
-      "🛠️ **管理員面板**\n在這裡控制 Counting 狀態（開始/暫停/停止）。\n（只有管理員能按）",
+    content: "🛠️ **管理員面板**\n在這裡控制 Counting 狀態（開始/暫停/停止）。\n（只有管理員能按）",
     components: [row1],
   };
 }
@@ -176,7 +181,6 @@ async function ensureAfkTimer(client) {
           continue;
         }
 
-        // 清狀態 & 刪房
         userRoomMap.delete(info.ownerId);
         roomActivity.delete(channelId);
 
@@ -189,6 +193,34 @@ async function ensureAfkTimer(client) {
       }
     } catch (_) {}
   }, AFK_SCAN_MS);
+}
+
+// ====== 安全互動 ACK（避免 40060 / 10062）======
+function isAckError(err) {
+  const code = err?.code;
+  return code === 40060 || code === 10062;
+}
+
+async function safeDeferReply(interaction) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    }
+    return true;
+  } catch (err) {
+    if (isAckError(err)) return false;
+    throw err;
+  }
+}
+
+async function safeEditOrReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) return await interaction.editReply(payload);
+    return await interaction.reply(payload);
+  } catch (err) {
+    if (isAckError(err)) return null;
+    throw err;
+  }
 }
 
 // ====== public: ping activity (index.js 會呼叫) ======
@@ -209,10 +241,7 @@ async function ensureLobbyChannelsAndButtons(guild) {
     {
       id: guild.roles.everyone.id,
       deny: [PermissionsBitField.Flags.SendMessages],
-      allow: [
-        PermissionsBitField.Flags.ViewChannel,
-        PermissionsBitField.Flags.ReadMessageHistory,
-      ],
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.ReadMessageHistory],
     },
     {
       id: guild.members.me.id,
@@ -225,7 +254,7 @@ async function ensureLobbyChannelsAndButtons(guild) {
     },
   ];
 
-  // 🟩-counting：大家要能打字（開始後才算數），所以允許 SendMessages
+  // 🟩-counting：大家要能打字（但是否有效由 games.js/countingState 控制）
   const countingOverwrites = [
     {
       id: guild.roles.everyone.id,
@@ -246,7 +275,7 @@ async function ensureLobbyChannelsAndButtons(guild) {
     },
   ];
 
-  // 管理員區：@everyone 看不到；管理員因為是 admin 會 bypass；機器人可看可講
+  // 管理員區：@everyone 看不到；機器人可看可講
   const adminOverwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
     {
@@ -292,11 +321,7 @@ async function ensureLobbyChannelsAndButtons(guild) {
     buildLobbyPayload("counting")
   );
 
-  await upsertMarkerMessage(
-    adminPanel,
-    `[[VIBE_ADMIN:PANEL]]`,
-    buildAdminPanelPayload(guild.id)
-  );
+  await upsertMarkerMessage(adminPanel, `[[VIBE_ADMIN:PANEL]]`, buildAdminPanelPayload(guild.id));
 
   return { guessLobby, hlLobby, countingLobby, adminPanel };
 }
@@ -357,6 +382,7 @@ async function createGameRoom(interaction, gameKey) {
     components: [closeRow],
   });
 
+  // 啟動遊戲
   if (gameKey === "hl") {
     const fake = { user: interaction.user, channel: room };
     await gamesMod.games.hlStart(fake, room.id, 13);
@@ -388,14 +414,18 @@ async function handleInteraction(interaction, ctx = {}) {
     const gameKey = id.split(":")[2];
 
     if (!["guess", "hl"].includes(gameKey)) {
-      await interaction.reply({
+      await safeEditOrReply(interaction, {
         content: "❌ 這個遊戲不支援建房。",
         flags: MessageFlags.Ephemeral,
       });
       return true;
     }
 
-    // ✅ Firestore lock（多進程也只會有一個真的建房）
+    // ✅ 先 ACK：避免 3 秒超時 / unknown interaction
+    const okAck = await safeDeferReply(interaction);
+    if (!okAck) return true; // 其他進程已 ack
+
+    // ✅ Firestore 原子鎖：多進程也只會成功一次
     const lock = await roomState.tryLockRoom({
       guildId: interaction.guildId,
       userId: interaction.user.id,
@@ -404,13 +434,13 @@ async function handleInteraction(interaction, ctx = {}) {
 
     if (!lock.ok) {
       if (lock.reason === "active_exists" && lock.channelId) {
-        await interaction.reply({
+        await safeEditOrReply(interaction, {
           content: `⚠️ 你已經有房間：<#${lock.channelId}>`,
           flags: MessageFlags.Ephemeral,
         });
         return true;
       }
-      await interaction.reply({
+      await safeEditOrReply(interaction, {
         content: "⏳ 正在建立房間中，請稍後再試一次。",
         flags: MessageFlags.Ephemeral,
       });
@@ -420,14 +450,13 @@ async function handleInteraction(interaction, ctx = {}) {
     // 同一進程內再擋一次（非主要保險）
     const existing = userRoomMap.get(interaction.user.id);
     if (existing?.channelId) {
-      await interaction.reply({
+      await safeEditOrReply(interaction, {
         content: `⚠️ 你目前已有一間房：<#${existing.channelId}>`,
         flags: MessageFlags.Ephemeral,
       });
       return true;
     }
 
-    await interaction.deferUpdate().catch(() => {});
     const room = await createGameRoom(interaction, gameKey);
 
     await roomState.setRoomActive({
@@ -437,13 +466,10 @@ async function handleInteraction(interaction, ctx = {}) {
       channelId: room.id,
     });
 
-    // ✅ 建房提示改成只有本人看的 ephemeral
-    await interaction
-      .followUp({
-        content: `✅ 已建立你的房間：<#${room.id}>`,
-        flags: MessageFlags.Ephemeral,
-      })
-      .catch(() => {});
+    await safeEditOrReply(interaction, {
+      content: `✅ 已建立你的房間：<#${room.id}>`,
+      flags: MessageFlags.Ephemeral,
+    });
 
     return true;
   }
@@ -451,12 +477,15 @@ async function handleInteraction(interaction, ctx = {}) {
   // ===== 房間關閉 =====
   if (id.startsWith("room:close:")) {
     const [, , ownerId, guildId] = id.split(":");
+
+    const okAck = await safeDeferReply(interaction);
+    if (!okAck) return true;
+
     if (interaction.user.id !== ownerId) {
-      await interaction.reply({ content: "❌ 只有房主能關房。", flags: MessageFlags.Ephemeral });
+      await safeEditOrReply(interaction, { content: "❌ 只有房主能關房。", flags: MessageFlags.Ephemeral });
       return true;
     }
 
-    await interaction.deferUpdate().catch(() => {});
     const ch = interaction.channel;
 
     userRoomMap.delete(ownerId);
@@ -466,33 +495,33 @@ async function handleInteraction(interaction, ctx = {}) {
     gamesMod.games.guessStop(ch.id);
     gamesMod.games.hlStop(ch.id);
 
+    await safeEditOrReply(interaction, { content: "🗑 正在關閉房間…", flags: MessageFlags.Ephemeral });
     await ch.delete("room closed").catch(() => {});
     return true;
   }
 
   // ===== 管理員：Counting 控制面板 =====
   if (id.startsWith("admin:counting:")) {
+    const okAck = await safeDeferReply(interaction);
+    if (!okAck) return true;
+
     if (!isAdminMember(interaction)) {
-      await interaction.reply({ content: "❌ 只有管理員能操作。", flags: MessageFlags.Ephemeral });
+      await safeEditOrReply(interaction, { content: "❌ 只有管理員能操作。", flags: MessageFlags.Ephemeral });
       return true;
     }
 
     const [, , action, guildId] = id.split(":");
     if (guildId !== interaction.guildId) {
-      await interaction.reply({ content: "❌ guild 不匹配。", flags: MessageFlags.Ephemeral });
+      await safeEditOrReply(interaction, { content: "❌ guild 不匹配。", flags: MessageFlags.Ephemeral });
       return true;
     }
 
-    await interaction.deferUpdate().catch(() => {});
-
     const countingLobby = getCountingLobbyChannel(interaction.guild);
     if (!countingLobby) {
-      await interaction
-        .followUp({
-          content: "❌ 找不到 🟩-counting 頻道，請先 /install。",
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
+      await safeEditOrReply(interaction, {
+        content: "❌ 找不到 🟩-counting 頻道，請先 /install。",
+        flags: MessageFlags.Ephemeral,
+      });
       return true;
     }
 
@@ -502,17 +531,15 @@ async function handleInteraction(interaction, ctx = {}) {
         expected: 1,
         lastUserId: null,
       });
-
       await countingLobby.send("🟩 **Counting 已開始！** 🔢 請輸入 **1** 開始接龍。");
+      await safeEditOrReply(interaction, { content: "✅ 已開始 Counting", flags: MessageFlags.Ephemeral });
       return true;
     }
 
     if (action === "pause") {
-      await countingDb.setCounting(interaction.guildId, countingLobby.id, {
-        state: "paused",
-      });
-
+      await countingDb.setCounting(interaction.guildId, countingLobby.id, { state: "paused" });
       await countingLobby.send("⏸ **Counting 已暫停。**（暫停期間任何訊息都會被刪除並私訊提醒）");
+      await safeEditOrReply(interaction, { content: "✅ 已暫停 Counting", flags: MessageFlags.Ephemeral });
       return true;
     }
 
@@ -522,11 +549,12 @@ async function handleInteraction(interaction, ctx = {}) {
         expected: 1,
         lastUserId: null,
       });
-
       await countingLobby.send("🛑 **Counting 已停止。**（停止期間任何訊息都會被刪除並私訊提醒）");
+      await safeEditOrReply(interaction, { content: "✅ 已停止 Counting", flags: MessageFlags.Ephemeral });
       return true;
     }
 
+    await safeEditOrReply(interaction, { content: "❌ 未知操作", flags: MessageFlags.Ephemeral });
     return true;
   }
 
