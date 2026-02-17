@@ -1,71 +1,63 @@
 "use strict";
 
 /**
- * src/db/roomState.js
- * Firestore: roomLocks / rooms
+ * Firestore 房間狀態 / 原子鎖
+ * doc 路徑：roomState/{guildId_userId}
  *
- * 需求：
- * - 多進程 / 多副本下，按一次只建立一間房（distributed lock）
- * - 能查到使用者是否已有房（避免兩間）
- *
- * env:
- * - FIREBASE_SERVICE_ACCOUNT_B64 (base64 JSON service account)
+ * tryLockRoom：用 transaction 保證多進程只有一個成功
+ * setRoomActive：寫入 channelId
+ * clearRoom：清掉狀態
  */
 
 const initFirebase = require("./initFirebase");
 
-function mustDb() {
+function keyOf(guildId, userId) {
+  return `${guildId}_${userId}`;
+}
+
+function now() {
+  return Date.now();
+}
+
+// lock 過期時間（避免死鎖），建房通常幾秒就結束
+const LOCK_TTL_MS = 25 * 1000;
+
+async function getDb() {
   const admin = initFirebase();
   if (!admin) throw new Error("Firebase not initialized");
   return admin.firestore();
 }
 
-const LOCK_TTL_MS = 15 * 1000; // 15 秒鎖，避免死鎖
-const ROOM_TTL_MS = 24 * 60 * 60 * 1000; // 房狀態保留 1 天（可調）
-
-function lockDocId(guildId, userId) {
-  return `${guildId}_${userId}`;
-}
-function roomDocId(guildId, userId) {
-  return `${guildId}_${userId}`;
-}
-
 async function tryLockRoom({ guildId, userId, gameKey }) {
-  const db = mustDb();
-  const now = Date.now();
-
-  const lockRef = db.collection("roomLocks").doc(lockDocId(guildId, userId));
-  const roomRef = db.collection("rooms").doc(roomDocId(guildId, userId));
+  const db = await getDb();
+  const ref = db.collection("roomState").doc(keyOf(guildId, userId));
 
   try {
     const result = await db.runTransaction(async (t) => {
-      const roomSnap = await t.get(roomRef);
-      if (roomSnap.exists) {
-        const data = roomSnap.data() || {};
-        // 如果已經有 active 房，直接回覆
-        if (data.active && data.channelId) {
-          return { ok: false, reason: "active_exists", channelId: data.channelId };
-        }
+      const snap = await t.get(ref);
+      const data = snap.exists ? snap.data() : null;
+
+      // 已有有效房間
+      if (data?.active && data.channelId) {
+        return { ok: false, reason: "active_exists", channelId: data.channelId };
       }
 
-      const lockSnap = await t.get(lockRef);
-      if (lockSnap.exists) {
-        const lock = lockSnap.data() || {};
-        const expiresAt = Number(lock.expiresAt || 0);
-        if (expiresAt > now) {
-          return { ok: false, reason: "locked" };
-        }
+      // 有 lock 但還沒過期 => 代表另一個進程正在建
+      if (data?.lockedUntil && data.lockedUntil > now()) {
+        return { ok: false, reason: "locked" };
       }
 
-      // 建立鎖
+      // 取得 lock（原子）
       t.set(
-        lockRef,
+        ref,
         {
           guildId,
           userId,
           gameKey,
-          createdAt: now,
-          expiresAt: now + LOCK_TTL_MS,
+          active: false,
+          channelId: null,
+          lockedUntil: now() + LOCK_TTL_MS,
+          updatedAt: now(),
         },
         { merge: true }
       );
@@ -75,60 +67,46 @@ async function tryLockRoom({ guildId, userId, gameKey }) {
 
     return result;
   } catch (e) {
-    console.error("❌ tryLockRoom error:", e);
+    console.error("❌ Firestore tryLockRoom error:", e);
     return { ok: false, reason: "error" };
   }
 }
 
 async function setRoomActive({ guildId, userId, gameKey, channelId }) {
-  const db = mustDb();
-  const now = Date.now();
-  const roomRef = db.collection("rooms").doc(roomDocId(guildId, userId));
-  const lockRef = db.collection("roomLocks").doc(lockDocId(guildId, userId));
+  const db = await getDb();
+  const ref = db.collection("roomState").doc(keyOf(guildId, userId));
 
-  await db.runTransaction(async (t) => {
-    t.set(
-      roomRef,
-      {
-        guildId,
-        userId,
-        gameKey,
-        channelId,
-        active: true,
-        updatedAt: now,
-        expiresAt: now + ROOM_TTL_MS,
-      },
-      { merge: true }
-    );
-    // 建完房就把鎖清掉（避免鎖卡住）
-    t.delete(lockRef);
-  });
+  await ref.set(
+    {
+      guildId,
+      userId,
+      gameKey,
+      active: true,
+      channelId,
+      lockedUntil: 0,
+      updatedAt: now(),
+    },
+    { merge: true }
+  );
 }
 
 async function clearRoom({ guildId, userId }) {
-  const db = mustDb();
-  const roomRef = db.collection("rooms").doc(roomDocId(guildId, userId));
-  const lockRef = db.collection("roomLocks").doc(lockDocId(guildId, userId));
+  const db = await getDb();
+  const ref = db.collection("roomState").doc(keyOf(guildId, userId));
 
-  await db.runTransaction(async (t) => {
-    t.delete(roomRef);
-    t.delete(lockRef);
-  });
-}
-
-async function getActiveRoom({ guildId, userId }) {
-  const db = mustDb();
-  const roomRef = db.collection("rooms").doc(roomDocId(guildId, userId));
-  const snap = await roomRef.get();
-  if (!snap.exists) return null;
-  const data = snap.data() || {};
-  if (!data.active || !data.channelId) return null;
-  return data;
+  await ref.set(
+    {
+      active: false,
+      channelId: null,
+      lockedUntil: 0,
+      updatedAt: now(),
+    },
+    { merge: true }
+  );
 }
 
 module.exports = {
   tryLockRoom,
   setRoomActive,
   clearRoom,
-  getActiveRoom,
 };
