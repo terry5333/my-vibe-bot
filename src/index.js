@@ -1,21 +1,19 @@
 "use strict";
 
 /**
- * ✅ 單一 interactionCreate / messageCreate
- * ✅ 全互動防重複（同進程）
- * ✅ Buttons/Selects/Modals -> lobbyButtons
- * ✅ HL buttons -> games.onInteraction
+ * src/index.js
+ * ✅ interaction 防重複（同一進程）
+ * ✅ Buttons/Modals/Select：先交給 lobbyButtons，只有沒處理才交給 games(HL)
+ * ✅ messageCreate：交給 games，並通知 lobbyButtons 更新活躍
  */
 
 const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
 const commands = require("./bot/commands");
-const games = require("./bot/games");
+const gamesMod = require("./bot/games");
 const lobbyButtons = require("./bot/lobbyButtons");
-const system = require("./bot/system");
 
-// ---- env ----
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error("❌ Missing env: DISCORD_TOKEN");
@@ -23,11 +21,15 @@ if (!DISCORD_TOKEN) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
   partials: [Partials.Channel],
 });
 
-// ---- anti-duplicate guard ----
+// ---- anti-duplicate interaction guard ----
 const handledInteractionIds = new Set();
 function markHandled(id) {
   if (handledInteractionIds.has(id)) return false;
@@ -45,23 +47,20 @@ client.once("ready", async () => {
   } catch (e) {
     console.error("[Commands] register failed:", e);
   }
-
-  // 啟動：載入狀態＋恢復 AFK 計時
-  await system.boot(client).catch((e) => console.error("[system.boot] error:", e));
 });
 
-// ✅ interactionCreate（只留這一個）
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!markHandled(interaction.id)) return;
 
-    // Buttons/Selects/Modals
-    if (interaction.isButton() || interaction.isAnySelectMenu() || interaction.isModalSubmit()) {
+    // Buttons/Modals/Selects -> lobbyButtons first
+    if (interaction.isButton() || interaction.isModalSubmit() || interaction.isAnySelectMenu()) {
       const handled = await lobbyButtons.handleInteraction(interaction, { client });
       if (handled) return;
 
-      if (interaction.isButton()) {
-        await games.onInteraction(interaction, { client });
+      // HL buttons only (games.js)
+      if (interaction.isButton() && typeof gamesMod?.onInteraction === "function") {
+        await gamesMod.onInteraction(interaction, { client });
       }
       return;
     }
@@ -72,6 +71,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
+
     await commands.execute(interaction, { client });
   } catch (err) {
     console.error("[interactionCreate] error:", err);
@@ -85,15 +85,16 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ✅ messageCreate
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    // 房間活動（AFK）
-    system.pingActivity(message.channelId, message.author.id);
+    // 更新活躍（如果你之後要做 AFK 關房會用到）
+    lobbyButtons.pingActivity(message.channelId, message.author.id);
 
-    await games.onMessage(message, { client });
+    if (typeof gamesMod?.onMessage === "function") {
+      await gamesMod.onMessage(message, { client });
+    }
   } catch (err) {
     console.error("[messageCreate] error:", err);
   }
