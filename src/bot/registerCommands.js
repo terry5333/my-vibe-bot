@@ -1,13 +1,12 @@
 "use strict";
 
 /**
- * ✅ 只註冊 GUILD（避免指令兩份）
- * ✅ 可選清掉 GLOBAL：第一次修指令重複時用
- *    設定環境變數：CLEAR_GLOBAL_COMMANDS=true
+ * ✅ 只註冊 GUILD
+ * ✅ 可選清 GLOBAL（CLEAR_GLOBAL_COMMANDS=true）
  */
 
 const { REST, Routes } = require("discord.js");
-const adminCommands = require("./commands_admin");
+const admin = require("./commands_admin");
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -21,17 +20,15 @@ async function registerCommands() {
   const guildId = requireEnv("DISCORD_GUILD_ID");
 
   const rest = new REST({ version: "10" }).setToken(token);
-  const body = adminCommands.commandData;
+  const body = admin.commandData;
 
-  const clearGlobal =
-    String(process.env.CLEAR_GLOBAL_COMMANDS || "").toLowerCase() === "true";
-
+  const clearGlobal = String(process.env.CLEAR_GLOBAL_COMMANDS || "").toLowerCase() === "true";
   if (clearGlobal) {
     try {
       await rest.put(Routes.applicationCommands(clientId), { body: [] });
       console.log("[Commands] Cleared GLOBAL slash commands");
     } catch (e) {
-      console.warn("[Commands] Clear GLOBAL failed (ignore):", e?.message || e);
+      console.warn("[Commands] Clear GLOBAL failed:", e?.message || e);
     }
   }
 
