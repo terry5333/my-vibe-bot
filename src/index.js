@@ -1,25 +1,29 @@
 "use strict";
 
 /**
- * src/index.js
- * ✅ interaction 防重複（同一進程）
- * ✅ Buttons/Modals/Select：先交給 lobbyButtons，只有沒處理才交給 games(HL)
- * ✅ messageCreate：交給 games，並通知 lobbyButtons 更新活躍
+ * src/index.js（穩定整合版）
+ * - 防重複處理 interaction
+ * - Button -> lobby -> HL
+ * - Slash -> admin + public
+ * - message -> games
  */
 
-const { Client, GatewayIntentBits, Partials, MessageFlags } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
 const { registerCommands } = require("./bot/registerCommands");
-const commands = require("./bot/commands");
-const gamesMod = require("./bot/games");
-const lobbyButtons = require("./bot/lobbyButtons");
+const adminCommands = require("./bot/commands");
+const games = require("./bot/games");
+const lobby = require("./bot/lobbyButtons");
+const pointsDb = require("./db/points");
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-if (!DISCORD_TOKEN) {
-  console.error("❌ Missing env: DISCORD_TOKEN");
+// ---------------- env ----------------
+const TOKEN = process.env.DISCORD_TOKEN;
+if (!TOKEN) {
+  console.error("❌ Missing DISCORD_TOKEN");
   process.exit(1);
 }
 
+// ---------------- client ----------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -29,15 +33,18 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// ---- anti-duplicate interaction guard ----
-const handledInteractionIds = new Set();
-function markHandled(id) {
-  if (handledInteractionIds.has(id)) return false;
-  handledInteractionIds.add(id);
-  if (handledInteractionIds.size > 5000) handledInteractionIds.clear();
+// ---------------- anti duplicate ----------------
+const handled = new Set();
+
+function once(id) {
+  if (handled.has(id)) return false;
+  handled.add(id);
+
+  if (handled.size > 5000) handled.clear();
   return true;
 }
 
+// ---------------- ready ----------------
 client.once("ready", async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
 
@@ -49,55 +56,102 @@ client.once("ready", async () => {
   }
 });
 
+// ---------------- interaction ----------------
 client.on("interactionCreate", async (interaction) => {
+  if (!once(interaction.id)) return;
+
   try {
-    if (!markHandled(interaction.id)) return;
+    /* ================= BUTTON ================= */
+    if (interaction.isButton()) {
+      // lobby 先
+      const ok = await lobby.handleInteraction(interaction, { client }).catch(() => false);
+      if (ok) return;
 
-    // Buttons/Modals/Selects -> lobbyButtons first
-    if (interaction.isButton() || interaction.isModalSubmit() || interaction.isAnySelectMenu()) {
-      const handled = await lobbyButtons.handleInteraction(interaction, { client });
-      if (handled) return;
-
-      // HL buttons only (games.js)
-      if (interaction.isButton() && typeof gamesMod?.onInteraction === "function") {
-        await gamesMod.onInteraction(interaction, { client });
-      }
+      // HL 再
+      await games.onInteraction(interaction).catch(() => {});
       return;
     }
 
-    // Slash commands
+    /* ================= SLASH ================= */
     if (!interaction.isChatInputCommand()) return;
 
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // ===== public =====
+
+    // /points
+    if (interaction.commandName === "points") {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {});
+
+      const user =
+        interaction.options.getUser("user") || interaction.user;
+
+      const pts = await pointsDb.getPoints(user.id).catch(() => 0);
+
+      await interaction.editReply(
+        `🏅 ${user} 目前積分：**${pts}**`
+      );
+
+      return;
     }
 
-    await commands.execute(interaction, { client });
-  } catch (err) {
-    console.error("[interactionCreate] error:", err);
+    // /leaderboard
+    if (interaction.commandName === "leaderboard") {
+      await interaction.deferReply().catch(() => {});
+
+      const top = await pointsDb.getTop(10).catch(() => []);
+
+      if (!top.length) {
+        await interaction.editReply("📭 目前沒有排行榜資料");
+        return;
+      }
+
+      const lines = [];
+
+      for (let i = 0; i < top.length; i++) {
+        const u = top[i];
+
+        const m = await interaction.guild.members
+          .fetch(u.userId)
+          .catch(() => null);
+
+        const name = m ? m.user.tag : `<@${u.userId}>`;
+
+        lines.push(`${i + 1}. ${name} — **${u.points}**`);
+      }
+
+      await interaction.editReply(
+        "🏆 **積分排行榜**\n\n" + lines.join("\n")
+      );
+
+      return;
+    }
+
+    // ===== admin =====
+    await interaction.deferReply({ ephemeral: true }).catch(() => {});
+    await adminCommands.execute(interaction, { client });
+
+  } catch (e) {
+    console.error("interaction error:", e);
+
     try {
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply("❌ 指令執行出錯，請稍後再試。");
-      } else {
-        await interaction.reply({ content: "❌ 指令執行出錯，請稍後再試。", flags: MessageFlags.Ephemeral });
+        await interaction.editReply("❌ 發生錯誤");
       }
     } catch (_) {}
   }
 });
 
-client.on("messageCreate", async (message) => {
+// ---------------- message ----------------
+client.on("messageCreate", async (msg) => {
+  if (msg.author.bot) return;
+
   try {
-    if (message.author.bot) return;
+    lobby.pingActivity(msg.channelId, msg.author.id);
 
-    // 更新活躍（如果你之後要做 AFK 關房會用到）
-    lobbyButtons.pingActivity(message.channelId, message.author.id);
-
-    if (typeof gamesMod?.onMessage === "function") {
-      await gamesMod.onMessage(message, { client });
-    }
-  } catch (err) {
-    console.error("[messageCreate] error:", err);
+    await games.onMessage(msg).catch(() => {});
+  } catch (e) {
+    console.error("message error:", e);
   }
 });
 
-client.login(DISCORD_TOKEN);
+// ---------------- login ----------------
+client.login(TOKEN);
